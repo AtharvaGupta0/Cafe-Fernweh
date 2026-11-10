@@ -22,6 +22,6 @@
       "@client/*": ["src/client/*"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "scripts/**/*.js"],
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/**/*.ts", "scripts/**/*.js", "experiments/**/*.ts"],
   "exclude": ["dist", "node_modules", ".wrangler"]
 }

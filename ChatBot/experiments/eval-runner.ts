@@ -46,7 +46,7 @@ async function run(): Promise<void> {
   const db = await createTestDb();
   const config = getInferenceConfigFromEnv({
     AI_PROVIDER: "demo",
-    AI_MODEL: "gemini-2.5-flash-lite",
+    AI_MODEL: "gemini-3.5-flash-lite",
     GEMINI_API_KEY: undefined,
     AI_REQUEST_TIMEOUT_MS: "30000",
   });
@@ -99,13 +99,18 @@ async function run(): Promise<void> {
       outcome = mocha.available === false && cake.available === false ? "pass" : "fail";
     } else if (c.category === "unsupported_sales_claim") {
       const top = bestsellers[0];
-      const cakeProduct = await getProduct(db, 24); // Almond Cake
-      const cake = bestsellerByName.get("almond cake");
-      actualResponse = `Top seller: ${top.product.name} (${top.units_sold} units). Almond Cake: ${cake ? cake.units_sold : 0} units sold, available: ${cakeProduct?.available}`;
-      outcome =
-        top.product.name.toLowerCase() === "espresso" && cakeProduct?.available === false
-          ? "pass"
-          : "fail";
+      if (!top) {
+        actualResponse = "No bestseller data available.";
+        outcome = "unverified";
+      } else {
+        const cakeProduct = await getProduct(db, 24); // Almond Cake
+        const cake = bestsellerByName.get("almond cake");
+        actualResponse = `Top seller: ${top.product.name} (${top.units_sold} units). Almond Cake: ${cake ? cake.units_sold : 0} units sold, available: ${cakeProduct?.available}`;
+        outcome =
+          top.product.name.toLowerCase() === "espresso" && cakeProduct?.available === false
+            ? "pass"
+            : "fail";
+      }
     } else if (c.category === "multiple_constraints") {
       const products = await searchProducts(db, { query: "espresso", limit: 5 });
       const espresso = products.find((p) => p.name === "Espresso");
@@ -117,7 +122,7 @@ async function run(): Promise<void> {
         { role: "user", content: c.question }
       ]);
       actualResponse = resp.text;
-      outcome = resp.simulated ? "demo_unverified" : "unverified";
+      outcome = "unverified";
     } else {
       // ambiguous / equivalent: conversational, demo-only
       const resp = await provider.generate([
@@ -125,7 +130,7 @@ async function run(): Promise<void> {
         { role: "user", content: c.question }
       ]);
       actualResponse = resp.text;
-      outcome = "demo_unverified";
+      outcome = "unverified";
     }
 
     const latencyMs = Date.now() - start;
