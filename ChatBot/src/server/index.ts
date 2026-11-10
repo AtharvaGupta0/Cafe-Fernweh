@@ -26,6 +26,10 @@ import {
   sessionIdFromCookie,
   adminSessionCookie,
   clearAdminSessionCookie,
+  csrfTokenCookie,
+  clearCsrfTokenCookie,
+  generateCsrfToken,
+  validateCsrf,
   hashToken,
 } from "./lib/admin-auth";
 import { createProvider, getInferenceConfigFromEnv } from "./inference";
@@ -262,6 +266,19 @@ export default {
       return { sessionId };
     }
 
+    /** Secure flag: only set on HTTPS (production); local dev over HTTP omits it. */
+    function isSecure(c: any): boolean {
+      return c.req.url.startsWith("https://");
+    }
+
+    /** Require a valid double-submit CSRF token on state-changing requests. */
+    function requireCsrf(c: any): void {
+      const headerToken = c.req.header("X-CSRF-Token") ?? null;
+      if (!validateCsrf(c.req.header("Cookie") ?? null, headerToken)) {
+        throw new HTTPException(403, { message: "Invalid or missing CSRF token." });
+      }
+    }
+
     app.post("/admin/login", async (c) => {
       const body = await c.req.json<{ token?: unknown }>();
       const token = typeof body?.token === "string" ? body.token : "";
@@ -269,14 +286,36 @@ export default {
       if (!stored || !verifyToken(token, hashToken(stored))) {
         throw new HTTPException(401, { message: "Invalid admin token." });
       }
+      const secure = isSecure(c);
       const sessionId = createSession(token, 3600_000);
-      return c.json({ ok: true }, 200, { "Set-Cookie": adminSessionCookie(sessionId) });
+      const csrfToken = generateCsrfToken();
+      return c.json(
+        { ok: true },
+        200,
+        {
+          "Set-Cookie": [
+            adminSessionCookie(sessionId, secure),
+            csrfTokenCookie(csrfToken, secure),
+          ],
+        }
+      );
     });
 
     app.post("/admin/logout", (c) => {
+      requireCsrf(c);
       const sessionId = sessionIdFromCookie(c.req.header("Cookie"));
       if (sessionId) destroySession(sessionId);
-      return c.json({ ok: true }, 200, { "Set-Cookie": clearAdminSessionCookie() });
+      const secure = isSecure(c);
+      return c.json(
+        { ok: true },
+        200,
+        {
+          "Set-Cookie": [
+            clearAdminSessionCookie(secure),
+            clearCsrfTokenCookie(secure),
+          ],
+        }
+      );
     });
 
     app.get("/admin/menu", async (c) => {
@@ -289,6 +328,7 @@ export default {
 
     app.post("/admin/menu", async (c) => {
       requireAdmin(c);
+      requireCsrf(c);
       const db = getDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const input = await c.req.json<AdminProductInput>();
@@ -298,6 +338,7 @@ export default {
 
     app.delete("/admin/menu/:id", async (c) => {
       requireAdmin(c);
+      requireCsrf(c);
       const db = getDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const id = Number(c.req.param("id"));
@@ -318,6 +359,7 @@ export default {
 
     app.post("/admin/sales", async (c) => {
       requireAdmin(c);
+      requireCsrf(c);
       const db = getDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const input = await c.req.json<{ items: Array<{ product_id: number; quantity: number; unit_price_cents: number }> }>();
@@ -327,6 +369,7 @@ export default {
 
     app.post("/admin/sales/import", async (c) => {
       requireAdmin(c);
+      requireCsrf(c);
       const db = getDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const body = await c.req.json<{ csv?: unknown }>();

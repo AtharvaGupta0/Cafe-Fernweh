@@ -91,13 +91,53 @@ export function sessionIdFromCookie(cookieHeader: string | null | undefined): st
 }
 
 /** Build a Set-Cookie header for the admin session. */
-export function adminSessionCookie(sessionId: string): string {
-  return `cafe_session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600`;
+export function adminSessionCookie(sessionId: string, secure: boolean): string {
+  return `cafe_session=${sessionId}; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600${secure ? "; Secure" : ""}`;
 }
 
 /** Build a Set-Cookie header to clear the admin session. */
-export function clearAdminSessionCookie(): string {
-  return `cafe_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+export function clearAdminSessionCookie(secure: boolean): string {
+  return `cafe_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
+}
+
+/** Build a Set-Cookie header for the double-submit CSRF token (readable by JS). */
+export function csrfTokenCookie(token: string, secure: boolean): string {
+  return `csrf_token=${token}; Path=/; SameSite=Lax; Max-Age=3600${secure ? "; Secure" : ""}`;
+}
+
+/** Build a Set-Cookie header to clear the CSRF token. */
+export function clearCsrfTokenCookie(secure: boolean): string {
+  return `csrf_token=; Path=/; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
+}
+
+/** Generate a random double-submit CSRF token. */
+export function generateCsrfToken(): string {
+  return createHash("sha256")
+    .update(`${Date.now()}${Math.random()}`)
+    .digest("hex");
+}
+
+/**
+ * Verify the double-submit CSRF token: the X-CSRF-Token header must match the
+ * csrf_token cookie value. Returns false when either is missing or they differ.
+ */
+export function validateCsrf(
+  cookieHeader: string | null | undefined,
+  headerToken: string | null | undefined
+): boolean {
+  if (!headerToken) return false;
+  const cookieToken = sessionIdFromCookie(cookieHeader);
+  // sessionIdFromCookie looks for cafe_session; reuse the pattern for csrf_token.
+  const csrfMatch = cookieHeader
+    ? cookieHeader.match(/(?:^|;\s*)csrf_token=([^;]+)/)
+    : null;
+  const cookieCsrf = csrfMatch ? (csrfMatch[1] ?? null) : null;
+  if (!cookieCsrf || !cookieCsrf.length) return false;
+  if (cookieCsrf.length !== headerToken.length) return false;
+  return timingSafeEqual(
+    Buffer.from(cookieCsrf, "utf8"),
+    Buffer.from(headerToken, "utf8")
+  );
 }
 
 export type { AdminSession };
