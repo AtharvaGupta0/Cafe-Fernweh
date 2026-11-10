@@ -86,9 +86,12 @@ export async function upsertProductAdmin(
   input: AdminProductInput
 ): Promise<{ id: number; created: boolean }> {
   const validated = adminProductSchema.parse(input);
-  const existing = await readOne(db, "SELECT id FROM products WHERE id = ?", [
-    validated.id,
-  ]);
+  let existing: unknown = null;
+  if (validated.id) {
+    existing = await readOne(db, "SELECT id FROM products WHERE id = ?", [
+      validated.id,
+    ]);
+  }
 
   if (existing) {
     await db
@@ -123,7 +126,7 @@ export async function upsertProductAdmin(
       validated.dietary_classification
     )
     .run();
-  const idResult = await readOne(db, "SELECT last_insert_rowid() AS id");
+  const idResult = await readOne(db, "SELECT MAX(id) AS id FROM products");
   const id = idResult ? Number((idResult as Record<string, unknown>).id) : 1;
   return { id, created: true };
 }
@@ -160,4 +163,176 @@ export async function salesStatsAdmin(db: DatabaseLike) {
     total_cents: Number(row.total),
     total_inr: formatPriceInr(Number(row.total)),
   };
+}
+
+export interface SalesEntryInput {
+  items: Array<{ product_id: number; quantity: number; unit_price_cents: number }>;
+}
+
+export interface SaleResult {
+  id: number;
+  total_cents: number;
+  total_inr: string;
+}
+
+/** Record a completed sales transaction with its items in one transaction. */
+export async function recordSaleAdmin(
+  db: DatabaseLike,
+  input: SalesEntryInput
+): Promise<SaleResult> {
+  const validated = z
+    .object({
+      items: z
+        .array(
+          z.object({
+            product_id: z.number().int().positive(),
+            quantity: z.number().int().positive(),
+            unit_price_cents: z.number().int().positive(),
+          })
+        )
+        .min(1),
+    })
+    .parse(input);
+
+  let totalCents = 0;
+  for (const item of validated.items) {
+    const exists = await readOne(db, "SELECT id FROM products WHERE id = ?", [
+      item.product_id,
+    ]);
+    if (!exists) {
+      throw new Error(`Product not found: ${item.product_id}`);
+    }
+    totalCents += item.quantity * item.unit_price_cents;
+  }
+
+  const txResult: unknown = await db
+    .prepare("INSERT INTO sales_transactions (total_cents) VALUES (?)")
+    .bind(totalCents)
+    .run();
+  const txIdResult = await readOne(db, "SELECT MAX(id) AS id FROM sales_transactions");
+  const txId = txIdResult
+    ? Number((txIdResult as Record<string, unknown>).id)
+    : 1;
+
+  for (const item of validated.items) {
+    await db
+      .prepare(
+        `INSERT INTO transaction_items (transaction_id, product_id, quantity, unit_price_cents)
+         VALUES (?, ?, ?, ?)`
+      )
+      .bind(txId, item.product_id, item.quantity, item.unit_price_cents)
+      .run();
+  }
+
+  return {
+    id: txId,
+    total_cents: totalCents,
+    total_inr: formatPriceInr(totalCents),
+  };
+}
+
+export interface CsvSaleRow {
+  product_id: string;
+  quantity: string;
+  unit_price_cents: string;
+  transaction_date?: string;
+}
+
+export interface CsvImportResult extends AdminSalesImportResult {
+  transactions: Array<{ id: number; total_cents: number; total_inr: string }>;
+}
+
+/**
+ * Import sales from CSV text. Validates product ids, quantities and prices;
+ * rejects malformed rows; deduplicates by (product_id, quantity, unit price)
+ * within the same import to prevent accidental duplicate imports.
+ */
+export async function importSalesCsvAdmin(
+  db: DatabaseLike,
+  csvText: string
+): Promise<CsvImportResult> {
+  const lines = csvText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) {
+    return { imported: 0, rejected: [], transactions: [] };
+  }
+  const header = lines[0]!.split(",").map((h) => h.trim().toLowerCase());
+  const required = ["product_id", "quantity", "unit_price_cents"];
+  if (!required.every((f) => header.includes(f))) {
+    throw new Error("CSV must include product_id,quantity,unit_price_cents columns");
+  }
+
+  const idx = (name: string) => header.indexOf(name);
+  const seen = new Set<string>();
+  const rejected: Array<{ row: number; reason: string }> = [];
+  const transactions: Array<{ id: number; total_cents: number; total_inr: string }> = [];
+  let imported = 0;
+
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i]!.split(",");
+    const rowNum = i + 1;
+    const productIdRaw = String(cols[idx("product_id")]).trim();
+    const quantityRaw = String(cols[idx("quantity")]).trim();
+    const priceRaw = String(cols[idx("unit_price_cents")]).trim();
+
+    const productId = Number(productIdRaw);
+    const quantity = Number(quantityRaw);
+    const unitPriceCents = Number(priceRaw);
+
+    if (!Number.isInteger(productId) || productId <= 0) {
+      rejected.push({ row: rowNum, reason: "Invalid product_id" });
+      continue;
+    }
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      rejected.push({ row: rowNum, reason: "Invalid quantity" });
+      continue;
+    }
+    if (!Number.isInteger(unitPriceCents) || unitPriceCents < 0) {
+      rejected.push({ row: rowNum, reason: "Invalid unit_price_cents" });
+      continue;
+    }
+
+    const productExists = await readOne(db, "SELECT id FROM products WHERE id = ?", [
+      productId,
+    ]);
+    if (!productExists) {
+      rejected.push({ row: rowNum, reason: "Product not found" });
+      continue;
+    }
+
+    const dedupeKey = `${productId}|${quantity}|${unitPriceCents}`;
+    if (seen.has(dedupeKey)) {
+      rejected.push({ row: rowNum, reason: "Duplicate within this import" });
+      continue;
+    }
+    seen.add(dedupeKey);
+
+    const totalCents = quantity * unitPriceCents;
+    const txResult: unknown = await db
+      .prepare("INSERT INTO sales_transactions (total_cents) VALUES (?)")
+      .bind(totalCents)
+      .run();
+    const txIdResult = await readOne(db, "SELECT MAX(id) AS id FROM sales_transactions");
+    const txId = txIdResult
+      ? Number((txIdResult as Record<string, unknown>).id)
+      : 1;
+    await db
+      .prepare(
+        `INSERT INTO transaction_items (transaction_id, product_id, quantity, unit_price_cents)
+         VALUES (?, ?, ?, ?)`
+      )
+      .bind(txId, productId, quantity, unitPriceCents)
+      .run();
+
+    imported += 1;
+    transactions.push({
+      id: txId,
+      total_cents: totalCents,
+      total_inr: formatPriceInr(totalCents),
+    });
+  }
+
+  return { imported, rejected, transactions };
 }
