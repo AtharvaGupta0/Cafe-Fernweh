@@ -11,7 +11,8 @@
     "build:server": "wrangler deploy --dry-run",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "db:init": "node scripts/init-db.js"
+    "db:init": "node scripts/init-db.js",
+    "build:widget": "vite build --config src/client/widget/vite.config.ts"
   },
   "dependencies": {
     "hono": "^4.6.11",
