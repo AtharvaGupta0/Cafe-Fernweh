@@ -242,21 +242,35 @@ async function checkFactual(
   const prices = extractPricesWithPositions(response);
   if (prices.length === 0) return { constraint: null, detail: null };
   const products = await searchProducts(db, { query: "", limit: 200 });
-  const productNames = products.map((p) => p.name.toLowerCase());
+
+  // Find the product name whose occurrence is closest to the price mention,
+  // so a price is validated against the product it actually describes.
+  function nearestProduct(textLower: string, priceIndex: number): { product: typeof products[number]; distance: number } | null {
+    let best: { product: typeof products[number]; distance: number } | null = null;
+    for (const p of products) {
+      const name = p.name.toLowerCase();
+      let idx = textLower.indexOf(name);
+      while (idx !== -1) {
+        const distance = Math.abs(idx - priceIndex);
+        if (!best || distance < best.distance) {
+          best = { product: p, distance };
+        }
+        idx = textLower.indexOf(name, idx + 1);
+      }
+    }
+    return best;
+  }
+
+  const lower = response.toLowerCase();
   for (const price of prices) {
     const before = response.slice(Math.max(0, price.index - 20), price.index).toLowerCase();
     if (/\b(not|isn't|isnt|never|rather than|instead of)\s*$/.test(before)) continue;
-    const windowStart = Math.max(0, price.index - 60);
-    const windowEnd = Math.min(response.length, price.index + 60);
-    const window = response.slice(windowStart, windowEnd).toLowerCase();
-    if (!productNames.some((name) => window.includes(name))) continue;
-    const nearby = products
-      .filter((p) => window.includes(p.name.toLowerCase()))
-      .sort((a, b) => b.name.length - a.name.length)[0];
-    if (nearby && nearby.price_cents !== price.cents) {
+    const nearest = nearestProduct(lower, price.index);
+    if (!nearest) continue;
+    if (nearest.product.price_cents !== price.cents) {
       return {
         constraint: "price",
-        detail: `${nearby.name} is stated at ₹${(price.cents / 100).toFixed(2)} but verified price is ${nearby.price_inr}.`,
+        detail: `${nearest.product.name} is stated at ₹${(price.cents / 100).toFixed(2)} but verified price is ${nearest.product.price_inr}.`,
       };
     }
   }
