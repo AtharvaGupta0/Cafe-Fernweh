@@ -7,6 +7,12 @@ export interface InferenceConfig {
   timeoutMs: number;
 }
 
+// Single source of truth for generation parameters. These are reported by
+// /eval/status and recorded by the evaluation runner so trials are
+// reproducible; change them only with a prompt-version bump.
+export const GENERATION_TEMPERATURE = 0.3;
+export const GENERATION_MAX_OUTPUT_TOKENS = 800;
+
 export interface InferenceResult {
   text: string;
   provider: string;
@@ -74,8 +80,8 @@ function createGeminiProvider(config: InferenceConfig): InferenceProvider {
         const body: Record<string, unknown> = {
           contents,
           generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 800,
+            temperature: GENERATION_TEMPERATURE,
+            maxOutputTokens: GENERATION_MAX_OUTPUT_TOKENS,
           },
           safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_MEDIUM_AND_ABOVE" },

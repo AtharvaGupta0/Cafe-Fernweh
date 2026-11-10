@@ -5,7 +5,7 @@ import { prettyJSON } from "hono/pretty-json";
 
 import { wrapD1, wrapSqlJs, type D1Database, execStatements, readOne } from "./lib/db";
 import { SCHEMA_SQL, SEED_SQL } from "./lib/init-sql";
-import { runConversation, escapeHtml } from "./lib/orchestration";
+import { runConversation, escapeHtml, PROMPT_VERSION } from "./lib/orchestration";
 import { createConversationState, type ConversationState } from "./lib/state";
 import {
   listProductsAdmin,
@@ -39,8 +39,18 @@ import {
   validateSessionCsrf,
   hashToken,
 } from "./lib/admin-auth";
-import { createProvider, getInferenceConfigFromEnv } from "./inference";
-import { chatRequestSchema, type ChatResponse, type GroundingMode } from "@shared/schema";
+import {
+  createProvider,
+  getInferenceConfigFromEnv,
+  GENERATION_TEMPERATURE,
+  GENERATION_MAX_OUTPUT_TOKENS,
+} from "./inference";
+import {
+  chatRequestSchema,
+  groundingModeSchema,
+  type ChatResponse,
+  type GroundingMode,
+} from "@shared/schema";
 
 interface Env {
   DB?: D1Database;
@@ -65,6 +75,7 @@ const DEFAULT_MAX_TURNS = 10;
 // HttpOnly session cookies work across dev and production.
 const API_ROUTES = [
   "/health",
+  "/eval/status",
   "/menu",
   "/bestsellers",
   "/sales-stats",
@@ -80,6 +91,35 @@ function isApiRoute(pathname: string): boolean {
   return API_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(route + "/")
   );
+}
+
+const PRODUCTION_GROUNDING: GroundingMode = "retrieval_validation";
+
+/**
+ * Read the experimental-evaluation token. Accept a standard bearer
+ * Authorization header or the legacy X-Fernweh-Admin-Token header (with an
+ * optional Bearer prefix). Never log or echo the value.
+ */
+function evalTokenFromRequest(c: any): string {
+  const auth = c.req.header("Authorization") || "";
+  if (auth.startsWith("Bearer ")) return auth.slice(7).trim();
+  if (auth.length > 0) return auth.trim();
+  const legacy = c.req.header("X-Fernweh-Admin-Token") || "";
+  return legacy.startsWith("Bearer ") ? legacy.slice(7).trim() : legacy.trim();
+}
+
+/**
+ * Experimental modes are strictly opt-in. If the server has no
+ * DEV_ADMIN_TOKEN, or the presented token does not match, reject the request
+ * with 403 instead of silently running the production configuration. A silent
+ * downgrade would produce mislabelled experimental records.
+ */
+function requireEvalAccess(c: any, env: Env): void {
+  if (!env.DEV_ADMIN_TOKEN || evalTokenFromRequest(c) !== env.DEV_ADMIN_TOKEN) {
+    throw new HTTPException(403, {
+      message: "Experimental evaluation is not enabled or the token is invalid.",
+    });
+  }
 }
 
 // In-memory conversation store for the standalone demo (bounded per session).
@@ -234,6 +274,30 @@ export default {
 
     app.get("/health", (c) => c.json({ status: "ok", service: "cafe-fernweh" }));
 
+    // Protected preflight for the evaluation runner. It performs no model
+    // inference and exposes only non-secret provenance needed to verify that
+    // an experimental run is configured as intended.
+    app.get("/eval/status", (c) => {
+      requireEvalAccess(c, env);
+      const config = getInferenceConfigFromEnv({
+        AI_PROVIDER: env.AI_PROVIDER,
+        AI_MODEL: env.AI_MODEL,
+        GEMINI_API_KEY: env.GEMINI_API_KEY,
+        AI_REQUEST_TIMEOUT_MS: env.AI_REQUEST_TIMEOUT_MS,
+      });
+      return c.json({
+        ok: true,
+        prompt_version: PROMPT_VERSION,
+        provider: config.provider,
+        model: config.model,
+        generation_parameters: {
+          temperature: GENERATION_TEMPERATURE,
+          maxOutputTokens: GENERATION_MAX_OUTPUT_TOKENS,
+        },
+        modes: groundingModeSchema.options,
+      });
+    });
+
     app.get("/menu", async (c) => {
       const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
@@ -280,18 +344,14 @@ export default {
 
       const { message, conversation_id, grounding } = parsed.data;
 
-      // Experimental grounding configs are gated: only honoured with the dev
-      // admin token. Otherwise customers always get the production config.
-      let groundingMode: string;
-      if (grounding && env.DEV_ADMIN_TOKEN) {
-        const adminToken = c.req.header("Authorization") || c.req.header("X-Fernweh-Admin-Token") || "";
-        if (adminToken === `Bearer ${env.DEV_ADMIN_TOKEN}`) {
-          groundingMode = grounding;
-        } else {
-          groundingMode = "retrieval_validation";
-        }
-      } else {
-        groundingMode = "retrieval_validation";
+      // Experimental grounding configs are strictly gated. Production (D) is
+      // always available; any other mode requires a valid dev token and is
+      // rejected with 403 otherwise. Never silently downgrade a requested
+      // mode: that would produce mislabelled experimental records.
+      let groundingMode: GroundingMode = PRODUCTION_GROUNDING;
+      if (grounding && grounding !== PRODUCTION_GROUNDING) {
+        requireEvalAccess(c, env);
+        groundingMode = grounding;
       }
 
       const config = getInferenceConfigFromEnv({
@@ -341,6 +401,7 @@ export default {
         grounding_mode: usedMode as GroundingMode,
         used_tools: usedTools,
         products,
+        prompt_version: PROMPT_VERSION,
       };
       return c.json({ ...response, conversation_id: id });
     });

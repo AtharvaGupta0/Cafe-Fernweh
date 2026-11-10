@@ -145,6 +145,7 @@ export const chatResponseSchema = z.object({
   grounding_mode: groundingModeSchema,
   used_tools: z.array(toolNameSchema).default([]),
   products: z.array(productSchema).default([]),
+  prompt_version: z.string().optional(),
 });
 export type ChatResponse = z.infer<typeof chatResponseSchema>;
 

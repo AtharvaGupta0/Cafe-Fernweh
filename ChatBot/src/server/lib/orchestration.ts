@@ -39,6 +39,13 @@ import {
 } from "./state";
 import { validateReply, type ValidationFailure } from "./validation";
 
+/**
+ * Version of the system-prompt / orchestration logic. Bump whenever the
+ * prompt text or tool contract changes so evaluation records can be grouped
+ * by the exact prompt that produced them.
+ */
+export const PROMPT_VERSION = "2026-11-10.1";
+
 /** Maximum conversation turns retained per session (bounded history). */
 const DEFAULT_MAX_TURNS = 10;
 
