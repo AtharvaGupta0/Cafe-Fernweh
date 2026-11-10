@@ -6,6 +6,7 @@ import {
   clearConstraint,
   inheritIntoArgs,
   formatInherited,
+  temperatureFromProduct,
 } from "../src/server/lib/state";
 import { filterProducts } from "../src/server/lib/menu";
 import { runConversation } from "../src/server/lib/orchestration";
@@ -189,6 +190,123 @@ describe("conversational state", () => {
     expect(turn2.state.dietary).toBeUndefined();
     expect(turn2.state.category).toBe("Bakery");
     expect(turn2.products.every((p) => p.category === "Bakery")).toBe(true);
+  });
+
+  it("updateFromToolResult infers category and temperature from search_products results", () => {
+    const state = createConversationState();
+    const espresso = {
+      id: 1,
+      category_id: 1,
+      category: "Coffee",
+      name: "Espresso",
+      description: "A concentrated shot of arabica coffee, served black.",
+      price_cents: 9000,
+      price_inr: "₹90.00",
+      available: true,
+      dietary_classification: "vegan",
+      ingredients: ["Water", "Arabica coffee"],
+      allergens: [{ name: "Almonds", verified: false }],
+    };
+    const result = updateFromToolResult(
+      state,
+      "search_products",
+      { query: "espresso" },
+      { products: [espresso] }
+    );
+    expect(result.category).toBe("Coffee");
+    expect(result.temperature).toBe("hot");
+    expect(result.referencedProductIds).toEqual([1]);
+  });
+
+  it("updateFromToolResult does not narrow state when search returns multiple products", () => {
+    const state = createConversationState();
+    const result = updateFromToolResult(
+      state,
+      "search_products",
+      { query: "tea" },
+      {
+        products: [
+          { id: 9, category_id: 2, category: "Tea", name: "Masala Chai", description: "Spiced black tea brewed with milk.", price_cents: 6000, price_inr: "₹60.00", available: true, dietary_classification: "none", ingredients: [], allergens: [] },
+          { id: 10, category_id: 2, category: "Tea", name: "English Breakfast", description: "Classic black tea, served plain.", price_cents: 7000, price_inr: "₹70.00", available: true, dietary_classification: "vegan", ingredients: [], allergens: [] },
+        ],
+      }
+    );
+    // Multiple results: category not narrowed, products recorded.
+    expect(result.category).toBeUndefined();
+    expect(result.temperature).toBeUndefined();
+    expect(result.referencedProductIds).toEqual([9, 10]);
+  });
+
+  it("temperatureFromProduct infers hot from coffee names", () => {
+    const espresso = { name: "Espresso", description: "A concentrated shot of arabica coffee, served black." };
+    expect(temperatureFromProduct(espresso as any)).toBe("hot");
+    const icedCoffee = { name: "Iced Coffee", description: "Chilled coffee with milk over ice." };
+    expect(temperatureFromProduct(icedCoffee as any)).toBe("iced");
+    const coldBrew = { name: "Cold Brew", description: "Cold-steeped arabica, served over ice." };
+    expect(temperatureFromProduct(coldBrew as any)).toBe("iced");
+    const icedLatte = { name: "Iced Latte", description: "Espresso and cold milk over ice." };
+    expect(temperatureFromProduct(icedLatte as any)).toBe("iced");
+    const croissant = { name: "Butter Croissant", description: "Flaky butter pastry." };
+    expect(temperatureFromProduct(croissant as any)).toBeUndefined();
+  });
+
+  it("multi-turn: follow-up inherits category and temperature from filter (cold coffees -> cheapest)", async () => {
+    const db = await createTestDb();
+
+    // Turn 1: "What cold coffees do you have?" -> filter by Coffee + cold.
+    const turn1 = await runConversation(
+      {
+        db,
+        provider: scriptProvider([
+          JSON.stringify({
+            type: "tool",
+            name: "filter_products",
+            args: { category: "Coffee", temperature: "cold", limit: 10 },
+          }),
+          JSON.stringify({ type: "final", text: "Here are the cold coffees." }),
+        ]),
+        groundingMode: "retrieval_validation",
+        maxTurns: 10,
+        state: createConversationState(),
+      },
+      "What cold coffees do you have?",
+      []
+    );
+
+    expect(turn1.state.category).toBe("Coffee");
+    expect(turn1.state.temperature).toBe("cold");
+    expect(turn1.products.some((p) => p.name === "Cold Brew")).toBe(true);
+
+    // Turn 2: "Which of those is the cheapest?" -> inherits category + temperature.
+    const turn2 = await runConversation(
+      {
+        db,
+        provider: scriptProvider([
+          JSON.stringify({
+            type: "tool",
+            name: "filter_products",
+            args: {},
+          }),
+          JSON.stringify({ type: "final", text: "The cheapest cold coffee is Cold Brew." }),
+        ]),
+        groundingMode: "retrieval_validation",
+        maxTurns: 10,
+        state: turn1.state,
+      },
+      "Which of those is the cheapest?",
+      []
+    );
+
+    expect(turn2.state.category).toBe("Coffee");
+    expect(turn2.state.temperature).toBe("cold");
+    expect(turn2.products.length).toBeGreaterThan(0);
+    expect(turn2.products.every((p) => p.category === "Coffee")).toBe(true);
+    // Cheapest cold coffee should be Cold Brew (₹140), not Espresso (hot).
+    const cheapest = turn2.products.reduce((a, b) =>
+      a.price_cents <= b.price_cents ? a : b
+    );
+    expect(cheapest.name).toBe("Cold Brew");
+    expect(cheapest.price_cents).toBe(14000);
   });
 
   it("multi-turn: multiple simultaneous restrictions are inherited together", async () => {

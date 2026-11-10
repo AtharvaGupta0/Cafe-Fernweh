@@ -161,4 +161,55 @@ describe("menu operations", () => {
     expect(candidates.every((p) => p.available)).toBe(true);
     expect(candidates.every((p) => p.price_cents <= 15000)).toBe(true);
   });
+
+  it("filters by temperature: hot returns coffees and teas", async () => {
+    const db = await createTestDb();
+    const hot = await filterProducts(db, { temperature: "hot", limit: 50 });
+    expect(hot.length).toBeGreaterThan(0);
+    expect(hot.some((p) => p.name === "Espresso")).toBe(true);
+    expect(hot.some((p) => p.name === "Masala Chai")).toBe(true);
+    // Iced items should not appear in hot results.
+    expect(hot.some((p) => p.name === "Iced Coffee")).toBe(false);
+    expect(hot.some((p) => p.name === "Mint Lemonade")).toBe(false);
+  });
+
+  it("filters by temperature: cold returns iced and cold drinks", async () => {
+    const db = await createTestDb();
+    const cold = await filterProducts(db, { temperature: "cold", limit: 50 });
+    expect(cold.length).toBeGreaterThan(0);
+    expect(cold.some((p) => p.name === "Iced Coffee")).toBe(true);
+    expect(cold.some((p) => p.name === "Mint Lemonade")).toBe(true);
+    expect(cold.some((p) => p.name === "Cold Brew")).toBe(true);
+    // Hot items should not appear in cold results.
+    expect(cold.some((p) => p.name === "Espresso")).toBe(false);
+  });
+
+  it("filters by temperature: iced returns iced items", async () => {
+    const db = await createTestDb();
+    const iced = await filterProducts(db, { temperature: "iced", limit: 50 });
+    expect(iced.length).toBeGreaterThan(0);
+    expect(iced.some((p) => p.name === "Iced Coffee")).toBe(true);
+    expect(iced.some((p) => p.name === "Iced Latte")).toBe(true);
+    expect(iced.some((p) => p.name === "Iced Matcha Latte")).toBe(true);
+    expect(iced.some((p) => p.name === "Espresso")).toBe(false);
+  });
+
+  it("recommendation candidates pass temperature through to filterProducts", async () => {
+    const db = await createTestDb();
+    const coldVegan = await getRecommendationCandidates(db, {
+      constraints: {
+        dietary: "vegan",
+        temperature: "cold",
+        allergen_exclude: [],
+      },
+      limit: 10,
+    });
+    expect(coldVegan.length).toBeGreaterThan(0);
+    expect(
+      coldVegan.every((p) => p.dietary_classification === "vegan")
+    ).toBe(true);
+    // All returned items should be cold-compatible.
+    expect(coldVegan.some((p) => p.name === "Mint Lemonade")).toBe(true);
+    expect(coldVegan.some((p) => p.name === "Cold Brew")).toBe(true);
+  });
 });
