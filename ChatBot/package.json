@@ -12,7 +12,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:init": "node scripts/init-db.js",
-    "build:widget": "vite build --config src/client/widget/vite.config.ts"
+    "build:widget": "vite build --config src/client/widget/vite.config.ts",
+    "build:admin": "vite build --config src/client/admin/vite.config.ts"
   },
   "dependencies": {
     "hono": "^4.6.11",

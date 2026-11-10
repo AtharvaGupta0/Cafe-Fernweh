@@ -9,7 +9,7 @@ AI_MODEL = "gemini-3.5-flash-lite"
 AI_REQUEST_TIMEOUT_MS = "30000"
 MAX_CONVERSATION_TURNS = "10"
 MAX_MESSAGE_LENGTH = "2000"
-CORS_ALLOW_ORIGINS = "http://localhost:5173"
+CORS_ALLOW_ORIGINS = "http://localhost:5173,http://localhost:5174"
 ADMIN_TOKEN = ""
 
 # D1 database binding. For local development run: wrangler dev --local
@@ -18,6 +18,12 @@ ADMIN_TOKEN = ""
 binding = "DB"
 database_name = "cafe-fernweh"
 database_id = ""
+
+# Static assets: customer chat, admin dashboard and widget are served from the
+# same origin as the API so HttpOnly session cookies work across dev and prod.
+[[assets]]
+binding = "ASSETS"
+directory = "public"
 
 [observability]
 enabled = true

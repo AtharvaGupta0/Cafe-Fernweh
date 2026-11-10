@@ -16,7 +16,15 @@ import {
   salesStatsAdmin,
   recordSaleAdmin,
   importSalesCsvAdmin,
+  listIngredients,
+  listAllergens,
+  listProductIngredients,
+  setProductIngredients,
+  listProductAllergens,
+  setAllergenVerified,
   type AdminProductInput,
+  ingredientIdsSchema,
+  allergenVerifiedSchema,
 } from "./lib/admin";
 import {
   verifyToken,
@@ -37,6 +45,7 @@ import { chatRequestSchema, type ChatResponse, type GroundingMode } from "@share
 
 interface Env {
   DB?: D1Database;
+  ASSETS?: Fetcher;
   AI_PROVIDER?: string;
   AI_MODEL?: string;
   GEMINI_API_KEY?: string;
@@ -50,6 +59,23 @@ interface Env {
 
 const DEFAULT_MAX_MESSAGE_LENGTH = 2000;
 const DEFAULT_MAX_TURNS = 10;
+
+// API routes handled by the Worker. Everything else is served as a static
+// asset (customer chat, admin dashboard, widget) from the same origin so
+// HttpOnly session cookies work across dev and production.
+const API_ROUTES = [
+  "/health",
+  "/menu",
+  "/bestsellers",
+  "/sales-stats",
+  "/chat",
+  "/admin",
+];
+function isApiRoute(pathname: string): boolean {
+  return API_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(route + "/")
+  );
+}
 
 // In-memory conversation store for the standalone demo (bounded per session).
 // Not persistent across Worker isolates; sufficient for a single deployment.
@@ -117,27 +143,31 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const app = new Hono<{ Bindings: Env }>();
 
+    // Rate limiting applies to every request (API + static assets).
+    const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+    if (!allowRequest(ip, new URL(request.url).pathname, 60, 60_000)) {
+      return new Response(
+        JSON.stringify({ error: "Too many requests. Please slow down." }),
+        { status: 429, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     app.use("*", prettyJSON());
     app.use(
       "*",
       cors({
         origin: getCorsOrigins(env),
-        allowMethods: ["GET", "POST", "OPTIONS"],
-        allowHeaders: ["Content-Type", "Authorization", "X-Fernweh-Eval"],
-        credentials: false,
+        allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allowHeaders: [
+          "Content-Type",
+          "Authorization",
+          "X-Fernweh-Eval",
+          "X-CSRF-Token",
+        ],
+        credentials: true,
         maxAge: 600,
       })
     );
-
-    // Rate limiting: 60 requests per minute per IP per endpoint. In-memory
-    // state is per Worker isolate; see comment above the limiter.
-    app.use("*", async (c, next) => {
-      const ip = c.req.header("CF-Connecting-IP") || "unknown";
-      if (!allowRequest(ip, c.req.path, 60, 60_000)) {
-        throw new HTTPException(429, { message: "Too many requests. Please slow down." });
-      }
-      await next();
-    });
 
     app.get("/health", (c) => c.json({ status: "ok", service: "cafe-fernweh" }));
 
@@ -382,6 +412,71 @@ export default {
       return c.json(result);
     });
 
+    app.get("/admin/ingredients", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const ingredients = await listIngredients(db as any);
+      return c.json({ ingredients });
+    });
+
+    app.get("/admin/allergens", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const allergens = await listAllergens(db as any);
+      return c.json({ allergens });
+    });
+
+    app.get("/admin/menu/:id/ingredients", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const id = Number(c.req.param("id"));
+      const ingredients = await listProductIngredients(db as any, id);
+      return c.json({ ingredients });
+    });
+
+    app.put("/admin/menu/:id/ingredients", async (c) => {
+      requireAdmin(c);
+      requireCsrf(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const id = Number(c.req.param("id"));
+      const body = await c.req.json<{ ingredient_ids?: unknown }>();
+      const parsed = ingredientIdsSchema.safeParse(body);
+      if (!parsed.success) {
+        throw new HTTPException(400, { message: "Invalid ingredient list." });
+      }
+      await setProductIngredients(db as any, id, parsed.data.ingredient_ids);
+      return c.json({ id });
+    });
+
+    app.get("/admin/menu/:id/allergens", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const id = Number(c.req.param("id"));
+      const allergens = await listProductAllergens(db as any, id);
+      return c.json({ allergens });
+    });
+
+    app.put("/admin/menu/:id/allergens/:allergenId/verified", async (c) => {
+      requireAdmin(c);
+      requireCsrf(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const id = Number(c.req.param("id"));
+      const allergenId = Number(c.req.param("allergenId"));
+      const body = await c.req.json<{ verified?: unknown }>();
+      const parsed = allergenVerifiedSchema.safeParse(body);
+      if (!parsed.success) {
+        throw new HTTPException(400, { message: "Invalid verified flag." });
+      }
+      await setAllergenVerified(db as any, id, allergenId, parsed.data.verified);
+      return c.json({ id, allergenId, verified: parsed.data.verified });
+    });
+
     app.onError((err, c) => {
       // Safe error responses: never leak stack traces or internal details to the client.
       const status = err instanceof HTTPException ? err.status : 500;
@@ -389,6 +484,15 @@ export default {
       return c.json({ error: message }, status);
     });
 
-    return app.fetch(request, env);
+    // API routes are handled by the Hono app; everything else is served as a
+    // static asset from the same origin (customer chat, admin dashboard,
+    // widget). Assets are bound via wrangler [[assets]].
+    if (isApiRoute(new URL(request.url).pathname)) {
+      return app.fetch(request, env);
+    }
+    if (!env.ASSETS) {
+      return new Response("Not found", { status: 404 });
+    }
+    return env.ASSETS.fetch(request);
   },
 };

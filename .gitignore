@@ -13,6 +13,7 @@ dist/
 build/
 **/public/client/
 **/public/widget/
+**/public/admin/
 *.wrangler/state/
 .wrangler/
 

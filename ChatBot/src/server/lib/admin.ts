@@ -336,3 +336,126 @@ export async function importSalesCsvAdmin(
 
   return { imported, rejected, transactions };
 }
+
+export interface Ingredient {
+  id: number;
+  name: string;
+}
+
+export interface Allergen {
+  id: number;
+  name: string;
+}
+
+export interface ProductAllergen extends Allergen {
+  verified: boolean;
+}
+
+export interface ProductIngredientAssignment {
+  ingredient_ids: number[];
+}
+
+export const ingredientIdsSchema = z.object({
+  ingredient_ids: z.array(z.number().int().positive()),
+});
+
+export const allergenVerifiedSchema = z.object({
+  verified: z.boolean(),
+});
+
+/** List all available ingredients (master list). */
+export async function listIngredients(db: DatabaseLike): Promise<Ingredient[]> {
+  const rows = await readAll(
+    db,
+    "SELECT id, name FROM ingredients ORDER BY name"
+  );
+  return rows.map((r) => {
+    const row = r as Record<string, unknown>;
+    return { id: Number(row.id), name: String(row.name) };
+  });
+}
+
+/** List all available allergens (master list). */
+export async function listAllergens(db: DatabaseLike): Promise<Allergen[]> {
+  const rows = await readAll(db, "SELECT id, name FROM allergens ORDER BY name");
+  return rows.map((r) => {
+    const row = r as Record<string, unknown>;
+    return { id: Number(row.id), name: String(row.name) };
+  });
+}
+
+/** List ingredients for a product. */
+export async function listProductIngredients(
+  db: DatabaseLike,
+  productId: number
+): Promise<Ingredient[]> {
+  const rows = await readAll(
+    db,
+    `SELECT i.id, i.name FROM ingredients i
+     JOIN product_ingredients pi ON pi.ingredient_id = i.id
+     WHERE pi.product_id = ? ORDER BY i.name`,
+    [productId]
+  );
+  return rows.map((r) => {
+    const row = r as Record<string, unknown>;
+    return { id: Number(row.id), name: String(row.name) };
+  });
+}
+
+/** Replace a product's ingredients. */
+export async function setProductIngredients(
+  db: DatabaseLike,
+  productId: number,
+  ingredientIds: number[]
+): Promise<void> {
+  await db
+    .prepare("DELETE FROM product_ingredients WHERE product_id = ?")
+    .bind(productId)
+    .run();
+  for (const ingredientId of ingredientIds) {
+    await db
+      .prepare(
+        `INSERT OR IGNORE INTO product_ingredients (product_id, ingredient_id) VALUES (?, ?)`
+      )
+      .bind(productId, ingredientId)
+      .run();
+  }
+}
+
+/** List allergens for a product with verification status. */
+export async function listProductAllergens(
+  db: DatabaseLike,
+  productId: number
+): Promise<ProductAllergen[]> {
+  const rows = await readAll(
+    db,
+    `SELECT a.id, a.name, pa.verified FROM allergens a
+     JOIN product_allergens pa ON pa.allergen_id = a.id
+     WHERE pa.product_id = ? ORDER BY a.name`,
+    [productId]
+  );
+  return rows.map((r) => {
+    const row = r as Record<string, unknown>;
+    return {
+      id: Number(row.id),
+      name: String(row.name),
+      verified: Boolean(row.verified),
+    };
+  });
+}
+
+/** Toggle verification status of a product allergen. */
+export async function setAllergenVerified(
+  db: DatabaseLike,
+  productId: number,
+  allergenId: number,
+  verified: boolean
+): Promise<void> {
+  await db
+    .prepare(
+      `INSERT OR REPLACE INTO product_allergens (product_id, allergen_id, verified) VALUES (?, ?, ?)`
+    )
+    .bind(productId, allergenId, verified ? 1 : 0)
+    .run();
+}
+
