@@ -25,12 +25,15 @@ export interface ConversationState {
   taste?: string;
   /** Product IDs referenced in the current conversation context. */
   referencedProductIds: number[];
+  /** Recorded deterministic validation failures (Configuration D). */
+  validationFailures: Array<{ constraint: string; detail: string; at: number }>;
   updatedAt: number;
 }
 
 export function createConversationState(): ConversationState {
   return {
     referencedProductIds: [],
+    validationFailures: [],
     updatedAt: Date.now(),
   };
 }

@@ -37,6 +37,7 @@ import {
   inheritIntoArgs,
   formatInherited,
 } from "./state";
+import { validateReply, type ValidationFailure } from "./validation";
 
 /** Maximum conversation turns retained per session (bounded history). */
 const DEFAULT_MAX_TURNS = 10;
@@ -280,6 +281,28 @@ function toolResultToText(result: ToolResult): string {
   return JSON.stringify(result);
 }
 
+/**
+ * Build a safe, verified fallback reply when deterministic validation fails.
+ * Never repeats an unsupported model claim; only reports database facts.
+ */
+function buildSafeReply(products: Product[], failures: ValidationFailure[]): string {
+  const lines = products.map(
+    (p) =>
+      `- ${p.name}: ${p.price_inr}, ${p.available ? "available" : "unavailable"}, ${p.dietary_classification}.`
+  );
+  const failureNote = failures
+    .map((f) => `- ${f.constraint}: ${f.detail}`)
+    .join("\n");
+  return [
+    "I need to correct some details based on our verified menu:",
+    ...lines,
+    "",
+    "The following details could not be confirmed against our records:",
+    failureNote,
+    "Please ask if you would like help with anything else.",
+  ].join("\n");
+}
+
 export interface ConversationDependencies {
   db: DatabaseLike;
   provider: InferenceProvider;
@@ -357,8 +380,30 @@ export async function runConversation(
       ? parsed.finalText
       : toolResultToText({ kind: "error", message: "No response generated." });
 
+  // Configuration D: deterministic validation of factual claims before replying.
+  // Configuration C (retrieval) skips this layer but keeps essential security.
+  let finalReply = finalText;
+  if (mode === "retrieval_validation" && products.length > 0) {
+    const validation = await validateReply({
+      reply: finalText,
+      products,
+      db: deps.db,
+      constraints: { maxPriceCents: state.maxPriceCents, dietary: state.dietary },
+    });
+    if (!validation.valid) {
+      for (const f of validation.failures) {
+        state.validationFailures.push({
+          constraint: f.constraint,
+          detail: f.detail,
+          at: Date.now(),
+        });
+      }
+      finalReply = buildSafeReply(products, validation.failures);
+    }
+  }
+
   return {
-    reply: escapeHtml(finalText),
+    reply: escapeHtml(finalReply),
     groundingMode: mode,
     usedTools,
     products,
