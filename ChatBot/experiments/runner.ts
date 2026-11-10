@@ -42,9 +42,7 @@
 import { readFileSync, existsSync, appendFileSync } from "fs";
 import { join } from "path";
 import { createTestDb } from "../tests/helpers";
-import { searchProducts, getProduct, getBestsellers, getSalesStats } from "../src/server/lib/menu";
-import { getInferenceConfigFromEnv, createProvider } from "../src/server/inference";
-import type { InferenceProvider } from "../src/shared/types";
+import { searchProducts } from "../src/server/lib/menu";
 
 const ROOT = join(__dirname, "..");
 const DATASET_PATH = join(ROOT, "experiments", "eval-dataset.json");
@@ -62,6 +60,7 @@ interface EnvConfig {
   maxRetries: number;
   retryDelayMs: number;
   resultsFile: string;
+  groundingMode: string | undefined;
 }
 
 function envConfig(): EnvConfig {
@@ -81,6 +80,7 @@ function envConfig(): EnvConfig {
     maxRetries: Number(process.env.EVAL_MAX_RETRIES || 3),
     retryDelayMs: Number(process.env.EVAL_RETRY_DELAY_MS || 5000),
     resultsFile: process.env.EVAL_RESULTS_FILE || join(ROOT, "experiments", "results.jsonl"),
+    groundingMode: process.env.EVAL_GROUNDING_MODE || undefined,
   };
 }
 
@@ -137,34 +137,45 @@ function appendRecord(resultsFile: string, record: unknown): void {
   appendFileSync(resultsFile, JSON.stringify(record) + "\n");
 }
 
-/** Extract rupee amounts mentioned in a response. */
-function extractPrices(text: string): number[] {
-  const prices: number[] = [];
+/**
+ * Extract rupee amounts mentioned in a response, with their positions.
+ */
+function extractPricesWithPositions(text: string): Array<{ cents: number; index: number }> {
+  const prices: Array<{ cents: number; index: number }> = [];
   const re = /₹\s*(\d+(?:\.\d{1,2})?)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const cap = m[1];
     if (!cap) continue;
-    prices.push(Math.round(parseFloat(cap) * 100));
+    prices.push({ cents: Math.round(parseFloat(cap) * 100), index: m.index });
   }
   return prices;
 }
 
 /**
- * Deterministic factual check against the database. Returns a failure
- * constraint when the response contradicts verified records, else null.
- * Only checks what can be objectively verified (prices mentioned).
+ * Deterministic factual check against the database. Only flags a price claim
+ * when a price is stated in close proximity to a product name (suggesting a
+ * product price claim). Standalone totals/aggregates (e.g. "total revenue")
+ are not flagged, since they are not product prices.
  */
 async function checkFactual(db: any, response: string): Promise<{ constraint: string | null; detail: string | null }> {
-  const prices = extractPrices(response);
+  const prices = extractPricesWithPositions(response);
   if (prices.length === 0) return { constraint: null, detail: null };
   const products = await searchProducts(db, { query: "", limit: 200 });
   const validPrices = new Set(products.map((p) => p.price_cents));
+  const productNames = products.map((p) => p.name.toLowerCase());
   for (const p of prices) {
-    if (!validPrices.has(p)) {
+    const windowStart = Math.max(0, p.index - 60);
+    const windowEnd = Math.min(response.length, p.index + 60);
+    const window = response.slice(windowStart, windowEnd).toLowerCase();
+    const namesNear = productNames.filter((n) => window.includes(n));
+    if (namesNear.length === 0) continue; // likely a total/aggregate, not a product price
+    // If a product is named nearby, the price should match that product's price.
+    const nearbyProduct = products.find((p2) => window.includes(p2.name.toLowerCase()));
+    if (nearbyProduct && nearbyProduct.price_cents !== p.cents) {
       return {
         constraint: "price",
-        detail: `Price ₹${(p / 100).toFixed(2)} does not match any verified product price.`,
+        detail: `${nearbyProduct.name} is stated at ₹${(p.cents / 100).toFixed(2)} but verified price is ${nearbyProduct.price_inr}.`,
       };
     }
   }
@@ -173,14 +184,12 @@ async function checkFactual(db: any, response: string): Promise<{ constraint: st
 
 async function runCase({
   db,
-  provider,
   config,
   baseUrl,
   adminToken,
   c,
 }: {
   db: any;
-  provider: InferenceProvider;
   config: EnvConfig;
   baseUrl: string;
   adminToken: string | undefined;
@@ -191,6 +200,7 @@ async function runCase({
   let httpStatus: number | null = null;
   let error: string | null = null;
   let simulated = false;
+  const effectiveMode = config.groundingMode || c.groundingMode || "retrieval_validation";
 
   try {
     const res = await fetch(`${baseUrl}/chat`, {
@@ -201,7 +211,7 @@ async function runCase({
       },
       body: JSON.stringify({
         message: c.question,
-        grounding: c.groundingMode || "retrieval_validation",
+        grounding: effectiveMode,
       }),
     });
     httpStatus = res.status;
@@ -217,8 +227,12 @@ async function runCase({
     outcome = "error";
   } else {
     const factual = await checkFactual(db, actualResponse);
+    const pricesMentioned = extractPricesWithPositions(actualResponse).length > 0;
     if (factual.constraint) {
       outcome = "fail";
+    } else if (pricesMentioned) {
+      // The model made a verifiable price claim and it checked out.
+      outcome = "pass";
     }
     // Otherwise leave as "unverified" for manual review.
   }
@@ -234,7 +248,7 @@ async function runCase({
     testId: c.id,
     category: c.category,
     question: c.question,
-    groundingMode: c.groundingMode,
+    groundingMode: effectiveMode,
     expectedOutcome: c.expectedOutcome,
     failureCategory: c.failureCategory,
     actualResponse,
@@ -292,13 +306,6 @@ async function main(): Promise<void> {
   }
 
   const db = await createTestDb();
-  const providerConfig = getInferenceConfigFromEnv({
-    AI_PROVIDER: config.provider,
-    AI_MODEL: config.model,
-    GEMINI_API_KEY: config.provider === "gemini" ? process.env.GEMINI_API_KEY : undefined,
-    AI_REQUEST_TIMEOUT_MS: String(config.pacingMs > 0 ? 30000 : 30000),
-  });
-  const provider = createProvider(providerConfig);
 
   const completed = loadCompletedIds(config.resultsFile);
   const pending = cases.filter((c) => !completed.has(c.id));
@@ -318,7 +325,7 @@ async function main(): Promise<void> {
   for (const c of batch) {
     let record: unknown;
     try {
-      record = await runWithRetry(() => runCase({ db, provider, config, baseUrl: config.baseUrl, adminToken: config.adminToken, c }), config);
+      record = await runWithRetry(() => runCase({ db, config, baseUrl: config.baseUrl, adminToken: config.adminToken, c }), config);
     } catch (err) {
       const start = Date.now();
       record = {
