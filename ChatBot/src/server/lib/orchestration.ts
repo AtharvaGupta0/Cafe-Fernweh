@@ -370,8 +370,13 @@ export async function runConversation(
     usedTools.push(parsed.name as ToolName);
     state = updateFromToolResult(state, parsed.name as string, inheritedArgs, toolResult);
 
-    if (toolResult.kind === "products") products = toolResult.products;
-    else if (toolResult.kind === "product" && toolResult.product) products = [toolResult.product];
+    if (toolResult.kind === "products") {
+      for (const p of toolResult.products) {
+        if (!products.some((e) => e.id === p.id)) products.push(p);
+      }
+    } else if (toolResult.kind === "product" && toolResult.product) {
+      if (!products.some((e) => e.id === toolResult.product!.id)) products.push(toolResult.product);
+    }
 
     messages.push({ role: "assistant" as const, content: response.text });
     messages.push({

@@ -74,10 +74,33 @@ export function updateFromToolResult(
     if (c?.temperature) next.temperature = String(c.temperature);
     if (c?.taste) next.taste = String(c.taste);
   } else if (name === "search_products") {
-    // A search narrows context only when it returns a single clear product.
+    // A search narrows context when it returns products: record referenced
+    // products and inherit category/temperature from the results so follow-up
+    // questions can carry forward the discovered constraints.
     if (products.length === 1) {
       const p = products[0];
-      if (p) next.referencedProductIds = [p.id];
+      if (p) {
+        next.referencedProductIds = [p.id];
+        if (p.category) next.category = p.category;
+        const t = temperatureFromProduct(p);
+        if (t) next.temperature = t;
+      }
+    } else if (products.length > 1) {
+      // Multiple results: do not narrow category (customer hasn't selected
+      // one), but infer temperature from the search query so follow-ups can
+      // carry the hot/cold constraint forward.
+      if (!next.temperature) {
+        const q = String(args.query ?? "").toLowerCase();
+        if (/\b(iced|cold brew)\b/.test(q)) next.temperature = "iced";
+        else if (/\b(cold)\b/.test(q) && !/\b(iced)\b/.test(q)) next.temperature = "cold";
+        else if (/\b(hot)\b/.test(q)) next.temperature = "hot";
+      }
+      for (const p of products) {
+        if (p.id && !next.referencedProductIds.includes(p.id)) {
+          next.referencedProductIds.push(p.id);
+        }
+      }
+      next.referencedProductIds = next.referencedProductIds.slice(-20);
     }
   }
 
@@ -158,4 +181,16 @@ export function formatInherited(state: ConversationState): string {
 
 export function productToSummary(p: Product): string {
   return `${p.name} (${p.category}): ${p.price_inr}, ${p.available ? "available" : "unavailable"}, ${p.dietary_classification}.`;
+}
+
+/** Infer a temperature constraint from a product's name or description.
+ * Used to carry forward "hot"/"cold"/"iced" context across turns when the
+ * model discovers products via search rather than an explicit filter call. */
+export function temperatureFromProduct(p: Product): string | undefined {
+  const text = `${p.name} ${p.description ?? ""}`.toLowerCase();
+  if (/\b(iced|cold brew)\b/.test(text)) return "iced";
+  if (/\b(cold)\b/.test(text) && !/\b(iced)\b/.test(text)) return "cold";
+  if (/\b(hot)\b/.test(text)) return "hot";
+  if (/\b(espresso|americano|cappuccino|latte|flat white|mocha|chai|matcha latte|breakfast|green tea)\b/.test(text)) return "hot";
+  return undefined;
 }

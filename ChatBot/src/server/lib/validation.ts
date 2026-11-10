@@ -18,7 +18,7 @@
  */
 
 import { type Product, type DietaryRestriction } from "@shared/schema";
-import { evaluateDietary } from "./menu";
+import { evaluateDietary, DAIRY_ALLERGENS, NUT_ALLERGENS, GLUTEN_ALLERGENS } from "./menu";
 import type { DatabaseLike } from "@shared/types";
 
 export interface ValidationFailure {
@@ -45,8 +45,8 @@ const PRICE_RE = /₹\s*(\d+(?:\.\d{1,2})?)/g;
 const AVAILABLE_RE = /\b(available|in stock)\b/i;
 const UNAVAILABLE_RE = /\b(unavailable|out of stock|not available)\b/i;
 
-/** Dietary safety assertions: "is vegan" / "dairy-free" / etc. */
-const DIETARY_RE = /\b(is\s+)?(vegan|dairy.?free|lactose.?free|nut.?free|gluten.?free|vegetarian)\b/i;
+/** Dietary safety assertions: "is vegan" / "dairy-free" / etc. Global flag so every claim in the reply is found. */
+const DIETARY_RE = /\b(is\s+)?(vegan|dairy.?free|lactose.?free|nut.?free|gluten.?free|vegetarian)\b/gi;
 
 /**
  * Validate a model reply against verified tool results.
@@ -131,30 +131,68 @@ export async function validateReply({
       });
     }
 
-    // Dietary safety claims must match verified evaluation.
-    const dm = DIETARY_RE.exec(aroundProduct);
-    if (dm) {
+    // Dietary safety claims must match verified evaluation. Check every
+    // dietary claim found in the reply (global regex) and verify each against
+    // the database. A product claimed as vegan/dairy-free/etc. must be
+    // verified as safe by evaluateDietary; an unknown result is a failure.
+    const claimedRestrictions = new Set<string>();
+    for (const dm of reply.matchAll(DIETARY_RE)) {
       const claimedRaw = dm[2];
       if (!claimedRaw) continue;
-      const claimed = claimedRaw.toLowerCase().replace(/[.\s]/g, "") as DietaryRestriction;
+      const claimed = claimedRaw
+        .toLowerCase()
+        .replace(/[.\s]/g, "")
+        .replace(/-/g, "_") as DietaryRestriction;
       const validRestrictions: DietaryRestriction[] = [
         "vegan", "dairy_free", "lactose_free", "nut_free", "gluten_free", "vegetarian",
       ];
-      if (validRestrictions.includes(claimed)) {
-        const evalResult = await evaluateDietary(db, product.id, claimed);
-        if (evalResult.status !== "safe") {
-          failures.push({
-            constraint: "dietary",
-            detail: `${product.name} is stated as ${claimed} but verified status is ${evalResult.status}: ${evalResult.reason}`,
-          });
+      if (!validRestrictions.includes(claimed)) continue;
+      if (claimedRestrictions.has(claimed)) continue;
+      claimedRestrictions.add(claimed);
+
+      // Find the product this claim is about: look for a product name near
+      // the claim position, falling back to the product being iterated.
+      const claimIndex = dm.index ?? 0;
+      let targetProduct = product;
+      for (const [pName, p] of productByName) {
+        const idx = reply.toLowerCase().indexOf(pName);
+        if (idx !== -1 && Math.abs(idx - claimIndex) < 120) {
+          targetProduct = p;
+          break;
         }
+      }
+
+      const evalResult = await evaluateDietary(db, targetProduct.id, claimed);
+      if (evalResult.status !== "safe") {
+        failures.push({
+          constraint: "dietary",
+          detail: `${targetProduct.name} is stated as ${claimed} but verified status is ${evalResult.status}: ${evalResult.reason}`,
+        });
       }
     }
 
-    // Unverified allergen must not be declared safe.
+    // Unverified allergen must not be declared safe. Check both the
+    // specific allergen name and category-level claims (e.g. "nut-free"
+    // covering an unverified almond allergen). Keyword matching uses word
+    // boundaries so "nut-free" matches the nuts category but "donut" does not.
     const unverifiedAllergens = product.allergens.filter((a) => !a.verified);
+    const allergenCategoryMap: Record<string, string[]> = {
+      milk: [...DAIRY_ALLERGENS, "dairy"],
+      peanuts: [...NUT_ALLERGENS, "nut", "peanut"],
+      almonds: [...NUT_ALLERGENS, "nut", "almond"],
+      nuts: [...NUT_ALLERGENS, "nut"],
+      "gluten (wheat)": [...GLUTEN_ALLERGENS, "wheat"],
+      gluten: GLUTEN_ALLERGENS,
+    };
     for (const a of unverifiedAllergens) {
-      if (aroundProduct.toLowerCase().includes(a.name.toLowerCase()) && /safe|no .* allergen|allergen-free/i.test(aroundProduct)) {
+      const allergenName = a.name.toLowerCase();
+      const categoryNames = allergenCategoryMap[allergenName] ?? [allergenName];
+      const nameMatch = categoryNames.some((cn) => {
+        const re = new RegExp(`\\b${cn.replace(/[.]/g, "\\.")}\\b`, "i");
+        return re.test(aroundProduct);
+      });
+      const safeClaim = /safe|no .* allergen|allergen-free|nut.?free|dairy.?free|gluten.?free|lactose.?free/i.test(aroundProduct);
+      if (nameMatch && safeClaim) {
         failures.push({
           constraint: "allergen",
           detail: `${product.name} is stated allergen-safe but ${a.name} is unverified (cross-contact possible).`,

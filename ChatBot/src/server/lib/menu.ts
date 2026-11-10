@@ -3,13 +3,13 @@ import { productSchema, type Product, type DietaryRestriction } from "@shared/sc
 import { readAll, readOne, formatPriceInr } from "./db";
 
 /** Allergen names that indicate dairy, for lactose-free / dairy-free checks. */
-const DAIRY_ALLERGENS = ["milk"];
+export const DAIRY_ALLERGENS = ["milk"];
 /** Allergen names that indicate nuts, for nut-free checks. */
-const NUT_ALLERGENS = ["peanuts", "almonds", "nuts"];
+export const NUT_ALLERGENS = ["peanuts", "almonds", "nuts"];
 /** Allergen names that indicate gluten, for gluten-free checks. */
-const GLUTEN_ALLERGENS = ["gluten (wheat)", "gluten"];
+export const GLUTEN_ALLERGENS = ["gluten (wheat)", "gluten"];
 /** Allergen names that indicate animal products, for vegan checks. */
-const ANIMAL_ALLERGENS = ["milk", "eggs", "honey", "fish"];
+export const ANIMAL_ALLERGENS = ["milk", "eggs", "honey", "fish"];
 
 async function toProduct(db: DatabaseLike, row: unknown): Promise<Product | null> {
   if (!row) return null;
@@ -233,7 +233,23 @@ interface FilterArgs {
   dietary?: DietaryRestriction;
   allergen?: string; // exclude products with this verified allergen
   available?: boolean;
+  temperature?: string; // e.g. "hot", "iced", "cold", "warm"
   limit?: number;
+}
+
+/** Temperature keywords matched against product name and description. */
+const TEMPERATURE_KEYWORDS: Record<string, string[]> = {
+  hot: ["hot", "espresso", "americano", "cappuccino", "latte", "flat white", "mocha", "chai", "breakfast", "green tea", "matcha latte"],
+  iced: ["iced", "cold brew"],
+  cold: ["iced", "cold brew", "lemonade", "lassi"],
+  warm: ["hot", "chai", "latte", "matcha latte"],
+};
+
+function temperatureClause(temp: string): string {
+  const key = String(temp).toLowerCase();
+  const keywords = TEMPERATURE_KEYWORDS[key] ?? [key];
+  const conditions = keywords.map(() => "(LOWER(p.name) LIKE ? OR LOWER(p.description) LIKE ?)").join(" OR ");
+  return `(${conditions})`;
 }
 
 /** Filter products deterministically using parameterised SQL. */
@@ -279,6 +295,14 @@ export async function filterProducts(db: DatabaseLike, args: FilterArgs): Promis
       )`
     );
     params.push(args.allergen);
+  }
+  if (args.temperature) {
+    const clause = temperatureClause(args.temperature);
+    clauses.push(clause);
+    const keywords = TEMPERATURE_KEYWORDS[String(args.temperature).toLowerCase()] ?? [String(args.temperature)];
+    for (const kw of keywords) {
+      params.push(`%${kw}%`, `%${kw}%`);
+    }
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
@@ -381,6 +405,7 @@ export async function getRecommendationCandidates(
     dietary: args.constraints.dietary,
     allergen: args.constraints.allergen_exclude[0] || undefined,
     available: true,
+    temperature: args.constraints.temperature,
     limit: args.limit ?? 20,
   });
 }

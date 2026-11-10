@@ -70,6 +70,7 @@ export const productFilterArgsSchema = z.object({
   dietary: dietaryRestrictionSchema.optional(),
   allergen: z.string().optional(),
   available: z.boolean().optional(),
+  temperature: z.string().optional(), // e.g. "hot", "iced", "cold", "warm"
   limit: z.number().int().min(1).max(100).default(50),
 });
 
