@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createTestDb } from "./helpers";
 import { runConversation, escapeHtml } from "../src/server/lib/orchestration";
+import { createConversationState } from "../src/server/lib/state";
 import { type InferenceProvider } from "../src/shared/types";
 import { EVAL_CONFIGS } from "../src/shared/schema";
 
@@ -39,7 +40,13 @@ describe("grounded conversation orchestration", () => {
     ]);
 
     const result = await runConversation(
-      { db, provider, groundingMode: EVAL_CONFIGS.D.mode, maxTurns: 10 },
+      {
+        db,
+        provider,
+        groundingMode: EVAL_CONFIGS.D.mode,
+        maxTurns: 10,
+        state: createConversationState(),
+      },
       "Do you have espresso?",
       []
     );
@@ -60,7 +67,13 @@ describe("grounded conversation orchestration", () => {
     ]);
 
     const result = await runConversation(
-      { db, provider, groundingMode: EVAL_CONFIGS.A.mode, maxTurns: 10 },
+      {
+        db,
+        provider,
+        groundingMode: EVAL_CONFIGS.A.mode,
+        maxTurns: 10,
+        state: createConversationState(),
+      },
       "What is on the menu?",
       []
     );

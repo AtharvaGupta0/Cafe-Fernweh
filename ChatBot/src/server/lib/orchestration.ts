@@ -29,6 +29,14 @@ import {
   getSalesStats,
   getRecommendationCandidates,
 } from "./menu";
+import {
+  ConversationState,
+  createConversationState,
+  updateFromToolResult,
+  clearConstraint,
+  inheritIntoArgs,
+  formatInherited,
+} from "./state";
 
 /** Maximum conversation turns retained per session (bounded history). */
 const DEFAULT_MAX_TURNS = 10;
@@ -114,7 +122,7 @@ Available database tools (call at most one per turn; only the names below):
   args: { constraints: { category?, max_price_cents?, dietary?, allergen_exclude: string[], taste?, temperature? }, limit? }
 `;
 
-function systemPromptFor(mode: string): string {
+function systemPromptFor(mode: string, state: ConversationState): string {
   const base = `You are the assistant for Café Fernweh, a café. Be helpful, concise, and warm.
 You must never invent menu facts (prices, availability, ingredients, allergens, sales).
 When a customer asks about the menu, prices, availability, dietary suitability, or recommendations,
@@ -123,6 +131,11 @@ All prices are in Indian Rupees (₹). Monetary values in tool arguments are in 
 units): ₹1 = 100 paise, so ₹200 = 20000 paise. Distinguish lactose-free, dairy-free and vegan.
 Treat unknown allergen information as unknown; never label an item allergen-safe without verified evidence.
 Do not output HTML or markdown code fences in your final answer.`;
+
+  const inherited = formatInherited(state);
+  const contextLine = inherited === "none"
+    ? ""
+    : `\nActive conversation context (carried forward unless the customer overrides it): ${inherited}.`;
 
   switch (mode) {
     case "none":
@@ -142,7 +155,7 @@ The café menu (fictional, for demonstration) includes:
 
 Use this context when helpful, but prefer database tools for exact facts.`;
     case "retrieval":
-      return `${base}${TOOL_CATALOG}
+      return `${base}${TOOL_CATALOG}${contextLine}
 
 Output either a tool-call JSON object
 { "type": "tool", "name": "...", "args": {...} } or a final response
@@ -150,7 +163,7 @@ Output either a tool-call JSON object
 using only the data returned.`;
     case "retrieval_validation":
     default:
-      return `${base}${TOOL_CATALOG}
+      return `${base}${TOOL_CATALOG}${contextLine}
 
 Output either a tool-call JSON object
 { "type": "tool", "name": "...", "args": {...} } or a final response
@@ -280,10 +293,11 @@ export interface ConversationResult {
   groundingMode: string;
   usedTools: ToolName[];
   products: Product[];
+  state: ConversationState;
 }
 
 export async function runConversation(
-  deps: ConversationDependencies,
+  deps: ConversationDependencies & { state: ConversationState },
   message: string,
   history: Array<{ role: "user" | "assistant"; content: string }>
 ): Promise<ConversationResult> {
@@ -294,7 +308,9 @@ export async function runConversation(
     ? deps.groundingMode
     : "retrieval_validation";
 
-  const system = { role: "system" as const, content: systemPromptFor(mode) };
+  let state = deps.state;
+
+  const system = { role: "system" as const, content: systemPromptFor(mode, state) };
   const messages = [system, ...boundedHistory, { role: "user" as const, content: message }];
 
   const usedTools: ToolName[] = [];
@@ -304,8 +320,26 @@ export async function runConversation(
   let parsed = parseModelResponse(response.text);
 
   if (parsed.type === "tool" && mode !== "none" && mode !== "menu_context") {
-    const toolResult = await handleTool({ db: deps.db, name: parsed.name as ToolName, args: parsed.args || {} });
+    // Explicitly cleared constraints (null values) take effect before inheritance.
+    for (const [field, value] of Object.entries(parsed.args || {})) {
+      if (value === null) {
+        state = clearConstraint(state, field);
+      }
+    }
+
+    // Merge active conversation state into unset tool arguments so follow-up
+    // questions inherit relevant constraints (category, price, dietary, …).
+    const modelArgs: Record<string, unknown> = { ...(parsed.args || {}) };
+    const inheritedArgs = inheritIntoArgs(state, parsed.name as string, modelArgs);
+
+    const toolResult = await handleTool({
+      db: deps.db,
+      name: parsed.name as ToolName,
+      args: inheritedArgs,
+    });
     usedTools.push(parsed.name as ToolName);
+    state = updateFromToolResult(state, parsed.name as string, inheritedArgs, toolResult);
+
     if (toolResult.kind === "products") products = toolResult.products;
     else if (toolResult.kind === "product" && toolResult.product) products = [toolResult.product];
 
@@ -328,5 +362,6 @@ export async function runConversation(
     groundingMode: mode,
     usedTools,
     products,
+    state,
   };
 }

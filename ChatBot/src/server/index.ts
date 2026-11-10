@@ -6,6 +6,7 @@ import { prettyJSON } from "hono/pretty-json";
 import { wrapD1, wrapSqlJs, type D1Database, execStatements, readOne } from "./lib/db";
 import { SCHEMA_SQL, SEED_SQL } from "./lib/init-sql";
 import { runConversation, escapeHtml } from "./lib/orchestration";
+import { createConversationState, type ConversationState } from "./lib/state";
 import { createProvider, getInferenceConfigFromEnv } from "./inference";
 import { chatRequestSchema, type ChatResponse, type GroundingMode } from "@shared/schema";
 
@@ -27,6 +28,7 @@ const DEFAULT_MAX_TURNS = 10;
 // In-memory conversation store for the standalone demo (bounded per session).
 // Not persistent across Worker isolates; sufficient for a single deployment.
 const conversations = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
+const conversationStates = new Map<string, ConversationState>();
 
 // Very simple in-memory rate limiter (requests per window per IP).
 const rateLimit = new Map<string, { count: number; resetAt: number }>();
@@ -182,6 +184,7 @@ export default {
 
       const id = conversation_id || crypto.randomUUID();
       const history = conversations.get(id) || [];
+      const state = conversationStates.get(id) || createConversationState();
       const maxTurns = Number(env.MAX_CONVERSATION_TURNS || DEFAULT_MAX_TURNS);
       const maxMessageLength = Number(env.MAX_MESSAGE_LENGTH || DEFAULT_MAX_MESSAGE_LENGTH);
 
@@ -189,8 +192,21 @@ export default {
         throw new HTTPException(400, { message: "Message too long." });
       }
 
-      const { reply, groundingMode: usedMode, usedTools, products } = await runConversation(
-        { db: db as any, provider, groundingMode, maxMessageLength, maxTurns },
+      const {
+        reply,
+        groundingMode: usedMode,
+        usedTools,
+        products,
+        state: nextState,
+      } = await runConversation(
+        {
+          db: db as any,
+          provider,
+          groundingMode,
+          maxMessageLength,
+          maxTurns,
+          state,
+        },
         message,
         history
       );
@@ -198,6 +214,7 @@ export default {
       history.push({ role: "user", content: message });
       history.push({ role: "assistant", content: reply });
       conversations.set(id, history.slice(-maxTurns));
+      conversationStates.set(id, nextState);
 
       const response: ChatResponse = {
         reply,
