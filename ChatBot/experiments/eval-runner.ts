@@ -3,7 +3,7 @@
  *
  * Runs the experimental dataset (experiments/eval-dataset.json) against the
  * deterministic menu operations and the demo inference provider, recording
- * one JSONL record per case to experiments/results.jsonl.
+ * one JSONL record per case to experiments/demo-results.jsonl.
  *
  * This does NOT require GEMINI_API_KEY: it uses AI_PROVIDER=demo. Demo-mode
  * responses are recorded but their conversational outcome is marked
@@ -31,7 +31,7 @@ const ROOT = join(__dirname, "..");
 const DATASET = JSON.parse(
   readFileSync(join(ROOT, "experiments", "eval-dataset.json"), "utf8")
 );
-const OUT = join(ROOT, "experiments", "results.jsonl");
+const OUT = join(ROOT, "experiments", "demo-results.jsonl");
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -59,7 +59,9 @@ async function run(): Promise<void> {
   );
   const stats = await getSalesStats(db);
 
-  for (const c of DATASET.cases) {
+  const CASES = [...DATASET.sets.dev, ...DATASET.sets.heldOut];
+
+  for (const c of CASES) {
     const start = Date.now();
     let actualResponse = "";
     let outcome: "pass" | "fail" | "unverified" = "unverified";
@@ -157,7 +159,9 @@ async function run(): Promise<void> {
   await append({
     testId: "SUMMARY",
     category: "summary",
-    totalCases: DATASET.cases.length,
+    totalCases: CASES.length,
+    datasetVersion: DATASET.schemaVersion,
+    source: "demo-tooling-only",
     totalRevenueInr: stats.total_revenue_inr,
     totalTransactions: stats.total_transactions,
     timestamp: nowIso(),

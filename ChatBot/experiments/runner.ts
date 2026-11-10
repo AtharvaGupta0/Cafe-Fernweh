@@ -1,51 +1,67 @@
 /**
  * experiments/runner.ts
  *
- * Quota-conscious evaluation runner for the Café Fernweh AI behaviour study.
+ * Quota-conscious, resumable evaluation runner for the Café Fernweh AI
+ * behaviour study.
  *
  * Runs the experimental dataset (experiments/eval-dataset.json) against the
  * live Worker (genuine Gemini inference) or the demo provider, recording one
- * append-only JSONL record per case to experiments/results.jsonl.
+ * append-only JSONL record per case. A run manifest records the dataset
+ * version, requested configuration, server-reported model/prompt version,
+ * generation parameters and database snapshot before any case is run.
  *
- * Designed for the Gemini free tier, which exhibits throttling:
- *   - configurable batch size and concurrency (default 1)
- *   - conservative pacing between requests
-   - bounded retries for transient failures (429 / network)
-   - no repeated retries for invalid credentials (401 / 403)
-   - resumable: skips test cases already recorded for the current dataset
-   - unique run identifier per invocation
-   - selectable test sets (dev / heldOut) and categories
- *
- * Deterministic menu facts (price, availability, dietary, sales) are checked
- * against the database where a factual claim can be extracted; generative
- * responses that cannot be objectively checked are marked "unverified" for
- * manual review. No result is ever fabricated.
+ * Validity rules:
+ *   - A, B and C require a valid DEV_ADMIN_TOKEN (EVAL_ADMIN_TOKEN) because
+ *     the server must not silently downgrade an experimental request to D.
+ *   - Each record stores both the requested mode and the mode the server
+ *     actually used. A mismatch invalidates the record.
+ *   - Demo-provider output is marked simulated and invalid as model evidence.
+ *   - The two-turn follow-up case is actually sent as two turns.
+ *   - Resumption is keyed by test ID + configuration, not test ID alone.
  *
  * Usage (from ChatBot/):
- *   npx tsx experiments/runner.ts
+ *   EVAL_CONFIG=A EVAL_ADMIN_TOKEN=... npx tsx experiments/runner.ts
  *
- * Environment variables (all optional):
+ * Environment variables:
  *   EVAL_BASE_URL        Worker base URL (default http://127.0.0.1:8787)
- *   EVAL_ADMIN_TOKEN     token for non-D grounding modes (default none)
- *   EVAL_MODEL           model identifier (default gemini-3.5-flash-lite)
+ *   EVAL_CONFIG          A|B|C|D (preferred; default D)
+ *   EVAL_GROUNDING_MODE  raw mode (legacy alternative to EVAL_CONFIG)
+ *   EVAL_ADMIN_TOKEN     dev token required for A/B/C and for provenance checks
  *   EVAL_PROVIDER        gemini|demo (default gemini)
+ *   EVAL_MODEL           expected model identifier (default gemini-3.5-flash-lite)
  *   EVAL_SETS            comma-separated sets: dev,heldOut (default dev)
  *   EVAL_CATEGORIES      comma-separated category filter (default all)
  *   EVAL_BATCH_SIZE      cases per run (default 0 = all remaining)
- *   EVAL_CONCURRENCY     parallel requests (default 1)
  *   EVAL_PACING_MS       ms between requests (default 1000)
  *   EVAL_MAX_RETRIES     bounded retries for transient failures (default 3)
  *   EVAL_RETRY_DELAY_MS  base retry delay (default 5000)
- *   EVAL_RESULTS_FILE    output JSONL (default experiments/results.jsonl)
+ *   EVAL_MAX_CONSECUTIVE_ERRORS  abort after this many consecutive errors (default 2)
+ *   EVAL_RESULTS_FILE    output JSONL (default experiments/live-results.jsonl)
  */
 
 import { readFileSync, existsSync, appendFileSync } from "fs";
 import { join } from "path";
+import { createHash } from "crypto";
 import { createTestDb } from "../tests/helpers";
-import { searchProducts } from "../src/server/lib/menu";
+import { searchProducts, getSalesStats } from "../src/server/lib/menu";
+import {
+  EVAL_CONFIGS,
+  groundingModeSchema,
+  type GroundingMode,
+} from "../src/shared/schema";
 
 const ROOT = join(__dirname, "..");
 const DATASET_PATH = join(ROOT, "experiments", "eval-dataset.json");
+const DEFAULT_RESULTS = join(ROOT, "experiments", "live-results.jsonl");
+
+type ConfigId = keyof typeof EVAL_CONFIGS;
+
+const MODE_TO_CONFIG: Record<GroundingMode, ConfigId> = {
+  none: "A",
+  menu_context: "B",
+  retrieval: "C",
+  retrieval_validation: "D",
+};
 
 interface EnvConfig {
   baseUrl: string;
@@ -55,32 +71,66 @@ interface EnvConfig {
   sets: string[];
   categories: string[] | null;
   batchSize: number;
-  concurrency: number;
   pacingMs: number;
   maxRetries: number;
   retryDelayMs: number;
+  maxConsecutiveErrors: number;
   resultsFile: string;
-  groundingMode: string | undefined;
+  configId: ConfigId;
+  mode: GroundingMode;
+}
+
+function resolveRequestedConfig(): { configId: ConfigId; mode: GroundingMode } {
+  const rawId = process.env.EVAL_CONFIG?.trim().toUpperCase();
+  const rawMode = process.env.EVAL_GROUNDING_MODE?.trim();
+  if (rawId && rawMode) {
+    throw new Error("Set either EVAL_CONFIG or EVAL_GROUNDING_MODE, not both.");
+  }
+  if (rawId) {
+    if (!(rawId in EVAL_CONFIGS)) {
+      throw new Error(`EVAL_CONFIG must be one of A, B, C, D (got ${rawId}).`);
+    }
+    const configId = rawId as ConfigId;
+    return { configId, mode: EVAL_CONFIGS[configId].mode };
+  }
+  if (rawMode) {
+    const parsed = groundingModeSchema.safeParse(rawMode);
+    if (!parsed.success) {
+      throw new Error(
+        `EVAL_GROUNDING_MODE must be one of ${groundingModeSchema.options.join(", ")}.`
+      );
+    }
+    return { configId: MODE_TO_CONFIG[parsed.data], mode: parsed.data };
+  }
+  // Default to the production configuration, but record that choice
+  // explicitly in every result row.
+  return { configId: "D", mode: EVAL_CONFIGS.D.mode };
 }
 
 function envConfig(): EnvConfig {
   const rawSets = process.env.EVAL_SETS || "dev";
+  const provider = (process.env.EVAL_PROVIDER || "gemini") as "gemini" | "demo";
+  if (provider !== "gemini" && provider !== "demo") {
+    throw new Error("EVAL_PROVIDER must be gemini or demo.");
+  }
+  const requested = resolveRequestedConfig();
   return {
     baseUrl: process.env.EVAL_BASE_URL || "http://127.0.0.1:8787",
     adminToken: process.env.EVAL_ADMIN_TOKEN || undefined,
     model: process.env.EVAL_MODEL || "gemini-3.5-flash-lite",
-    provider: (process.env.EVAL_PROVIDER || "gemini") as "gemini" | "demo",
+    provider,
     sets: rawSets.split(",").map((s) => s.trim()).filter(Boolean),
     categories: process.env.EVAL_CATEGORIES
       ? process.env.EVAL_CATEGORIES.split(",").map((s) => s.trim()).filter(Boolean)
       : null,
     batchSize: Number(process.env.EVAL_BATCH_SIZE || 0),
-    concurrency: Math.max(1, Number(process.env.EVAL_CONCURRENCY || 1)),
     pacingMs: Number(process.env.EVAL_PACING_MS || 1000),
-    maxRetries: Number(process.env.EVAL_MAX_RETRIES || 3),
+    maxRetries: Math.max(0, Number(process.env.EVAL_MAX_RETRIES ?? 3)),
     retryDelayMs: Number(process.env.EVAL_RETRY_DELAY_MS || 5000),
-    resultsFile: process.env.EVAL_RESULTS_FILE || join(ROOT, "experiments", "results.jsonl"),
-    groundingMode: process.env.EVAL_GROUNDING_MODE || undefined,
+    maxConsecutiveErrors: Math.max(1, Number(process.env.EVAL_MAX_CONSECUTIVE_ERRORS || 2)),
+    resultsFile: process.env.EVAL_RESULTS_FILE || DEFAULT_RESULTS,
+    configId: requested.configId,
+    mode: requested.mode,
   };
 }
 
@@ -91,6 +141,9 @@ interface DatasetCase {
   groundingMode: string;
   expectedOutcome: string;
   failureCategory: string;
+  precedingQuestion?: string;
+  questionPart?: string;
+  setName?: string;
 }
 
 interface Dataset {
@@ -99,9 +152,17 @@ interface Dataset {
   sets: { dev: DatasetCase[]; heldOut: DatasetCase[] };
 }
 
+interface ServerStatus {
+  ok: boolean;
+  prompt_version: string;
+  provider: string;
+  model: string;
+  generation_parameters: { temperature: number; maxOutputTokens: number } | null;
+  modes: string[];
+}
+
 function loadDataset(): Dataset {
   const raw = JSON.parse(readFileSync(DATASET_PATH, "utf8")) as Dataset;
-  // Backwards-compat: older datasets have a flat "cases" array.
   if (!raw.sets && Array.isArray((raw as any).cases)) {
     return { ...raw, sets: { dev: (raw as any).cases, heldOut: [] } };
   }
@@ -113,21 +174,37 @@ function nowIso(): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Load already-recorded testIds for this run to support resumption. */
-function loadCompletedIds(resultsFile: string): Set<string> {
+async function delayWithJitter(ms: number): Promise<void> {
+  await sleep(ms + Math.floor(Math.random() * 300));
+}
+
+/**
+ * Load test IDs that already have a valid, non-error record for the selected
+ * configuration. Resumption must not be keyed by test ID alone: the same case
+ * is deliberately run under A, B, C and D.
+ */
+function loadCompletedIds(resultsFile: string, configId: ConfigId): Set<string> {
   const ids = new Set<string>();
   if (!existsSync(resultsFile)) return ids;
-  const content = readFileSync(resultsFile, "utf8");
-  for (const line of content.split("\n")) {
+  for (const line of readFileSync(resultsFile, "utf8").split("\n")) {
     if (!line.trim()) continue;
     try {
       const rec = JSON.parse(line);
-      if (rec && rec.testId) ids.add(rec.testId);
+      if (!rec?.testId) continue;
+      if (["SUMMARY", "MANIFEST", "ABORT"].includes(rec.testId)) continue;
+      const sameConfig = rec.experimentalConfig === configId;
+      const usable =
+        rec.valid !== false &&
+        rec.simulated !== true &&
+        rec.outcome !== "error" &&
+        rec.httpStatus === 200 &&
+        !rec.error;
+      if (sameConfig && usable) ids.add(rec.testId);
     } catch {
-      // ignore malformed lines
+      // ignore malformed lines; they are not evidence
     }
   }
   return ids;
@@ -137,214 +214,529 @@ function appendRecord(resultsFile: string, record: unknown): void {
   appendFileSync(resultsFile, JSON.stringify(record) + "\n");
 }
 
-/**
- * Extract rupee amounts mentioned in a response, with their positions.
- */
+function sha256(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
 function extractPricesWithPositions(text: string): Array<{ cents: number; index: number }> {
   const prices: Array<{ cents: number; index: number }> = [];
   const re = /₹\s*(\d+(?:\.\d{1,2})?)/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const cap = m[1];
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const cap = match[1];
     if (!cap) continue;
-    prices.push({ cents: Math.round(parseFloat(cap) * 100), index: m.index });
+    prices.push({ cents: Math.round(parseFloat(cap) * 100), index: match.index });
   }
   return prices;
 }
 
 /**
- * Deterministic factual check against the database. Only flags a price claim
- * when a price is stated in close proximity to a product name (suggesting a
- * product price claim). Standalone totals/aggregates (e.g. "total revenue")
- are not flagged, since they are not product prices.
+ * Deterministic check of product prices. Prices immediately preceded by a
+ * negation ("not ₹5", "not ₹5.00") are treated as refuted premises, not
+ * product claims. Aggregates are ignored because they are not product prices.
  */
-async function checkFactual(db: any, response: string): Promise<{ constraint: string | null; detail: string | null }> {
+async function checkFactual(
+  db: any,
+  response: string
+): Promise<{ constraint: string | null; detail: string | null }> {
   const prices = extractPricesWithPositions(response);
   if (prices.length === 0) return { constraint: null, detail: null };
   const products = await searchProducts(db, { query: "", limit: 200 });
-  const validPrices = new Set(products.map((p) => p.price_cents));
   const productNames = products.map((p) => p.name.toLowerCase());
-  for (const p of prices) {
-    const windowStart = Math.max(0, p.index - 60);
-    const windowEnd = Math.min(response.length, p.index + 60);
+  for (const price of prices) {
+    const before = response.slice(Math.max(0, price.index - 20), price.index).toLowerCase();
+    if (/\b(not|isn't|isnt|never|rather than|instead of)\s*$/.test(before)) continue;
+    const windowStart = Math.max(0, price.index - 60);
+    const windowEnd = Math.min(response.length, price.index + 60);
     const window = response.slice(windowStart, windowEnd).toLowerCase();
-    const namesNear = productNames.filter((n) => window.includes(n));
-    if (namesNear.length === 0) continue; // likely a total/aggregate, not a product price
-    // If a product is named nearby, the price should match that product's price.
-    const nearbyProduct = products.find((p2) => window.includes(p2.name.toLowerCase()));
-    if (nearbyProduct && nearbyProduct.price_cents !== p.cents) {
+    if (!productNames.some((name) => window.includes(name))) continue;
+    const nearby = products
+      .filter((p) => window.includes(p.name.toLowerCase()))
+      .sort((a, b) => b.name.length - a.name.length)[0];
+    if (nearby && nearby.price_cents !== price.cents) {
       return {
         constraint: "price",
-        detail: `${nearbyProduct.name} is stated at ₹${(p.cents / 100).toFixed(2)} but verified price is ${nearbyProduct.price_inr}.`,
+        detail: `${nearby.name} is stated at ₹${(price.cents / 100).toFixed(2)} but verified price is ${nearby.price_inr}.`,
       };
     }
   }
   return { constraint: null, detail: null };
 }
 
-async function runCase({
-  db,
+/** Category-specific deterministic checks where the expected answer is explicit. */
+async function checkConstraint(
+  db: any,
+  c: DatasetCase,
+  response: string
+): Promise<{ constraint: string | null; detail: string | null }> {
+  const lower = response.toLowerCase();
+  if (c.category === "follow_up_context") {
+    if (!lower.includes("cold brew") || lower.includes("masala chai")) {
+      return {
+        constraint: "constraint_following_failure",
+        detail:
+          "Follow-up reply did not preserve the cold-coffee constraint (expected Cold Brew, not Masala Chai).",
+      };
+    }
+  }
+  if (c.category === "fabricated_sales_statistic") {
+    const stats = (await getSalesStats(db)) as { total_transactions?: number };
+    const match = response.match(/(\d[\d,]*)\s+transactions?/i);
+    if (match) {
+      const stated = Number(match[1]!.replace(/,/g, ""));
+      if (Number.isFinite(stated) && stated !== Number(stats.total_transactions ?? -1)) {
+        return {
+          constraint: "unsupported_sales_claim",
+          detail: `Stated ${stated} transactions but recorded total is ${stats.total_transactions}.`,
+        };
+      }
+    }
+  }
+  return { constraint: null, detail: null };
+}
+
+interface ChatTurn {
+  status: number | null;
+  body: {
+    reply?: string;
+    grounding_mode?: string;
+    prompt_version?: string;
+    conversation_id?: string;
+    used_tools?: string[];
+  } | null;
+  error: string | null;
+  attempts: number;
+  latencyMs: number;
+}
+
+/**
+ * POST /chat with bounded retries for transient failures. Authentication and
+ * validation failures are never retried. Quota exhaustion returns a clear
+ * error after the configured retry budget rather than looping.
+ */
+async function postChat({
   config,
-  baseUrl,
-  adminToken,
-  c,
+  message,
+  grounding,
+  conversationId,
 }: {
+  config: EnvConfig;
+  message: string;
+  grounding: string;
+  conversationId?: string;
+}): Promise<ChatTurn> {
+  const start = Date.now();
+  let lastError = "Request failed.";
+  let attempts = 0;
+  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
+    attempts += 1;
+    try {
+      const res = await fetch(`${config.baseUrl}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(config.adminToken ? { Authorization: `Bearer ${config.adminToken}` } : {}),
+        },
+        body: JSON.stringify({
+          message,
+          grounding,
+          ...(conversationId ? { conversation_id: conversationId } : {}),
+        }),
+      });
+      const text = await res.text();
+      let body: ChatTurn["body"] = null;
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        body = null;
+      }
+      if ([408, 429, 500, 502, 503, 504].includes(res.status) && attempt < config.maxRetries) {
+        lastError = `HTTP ${res.status}`;
+        await delayWithJitter(config.retryDelayMs * (attempt + 1));
+        continue;
+      }
+      return {
+        status: res.status,
+        body,
+        error: res.ok ? null : `HTTP ${res.status}`,
+        attempts,
+        latencyMs: Date.now() - start,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt < config.maxRetries) {
+        await delayWithJitter(config.retryDelayMs * (attempt + 1));
+        continue;
+      }
+    }
+  }
+  return {
+    status: null,
+    body: null,
+    error: lastError,
+    attempts,
+    latencyMs: Date.now() - start,
+  };
+}
+
+/**
+ * Verify the evaluation configuration without spending model quota. The
+ * endpoint is protected by DEV_ADMIN_TOKEN and reports the server's actual
+ * provider/model/prompt version. A mismatch invalidates the run.
+ */
+async function preflight(config: EnvConfig): Promise<ServerStatus> {
+  const syntheticDemo: ServerStatus = {
+    ok: true,
+    prompt_version: "demo-provider",
+    provider: "demo",
+    model: config.model,
+    generation_parameters: null,
+    modes: groundingModeSchema.options,
+  };
+  if (config.provider === "demo" && config.mode === "retrieval_validation" && !config.adminToken) {
+    return syntheticDemo;
+  }
+  if (!config.adminToken) {
+    throw new Error(
+      "EVAL_ADMIN_TOKEN is required for a live evaluation run (and for any non-D configuration)."
+    );
+  }
+  const res = await fetch(`${config.baseUrl}/eval/status`, {
+    headers: { Authorization: `Bearer ${config.adminToken}` },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Evaluation preflight failed with HTTP ${res.status}. Is DEV_ADMIN_TOKEN configured on the Worker?`
+    );
+  }
+  const body = (await res.json()) as ServerStatus;
+  if (!body.ok || !Array.isArray(body.modes) || !body.modes.includes(config.mode)) {
+    throw new Error(`The server does not offer grounding mode "${config.mode}".`);
+  }
+  if (body.provider !== config.provider) {
+    throw new Error(
+      `Provider mismatch: runner expects ${config.provider}, server reports ${body.provider}.`
+    );
+  }
+  return body;
+}
+
+async function snapshotDb(db: any): Promise<Record<string, unknown>> {
+  const products = await searchProducts(db, { query: "", limit: 500 });
+  const stats = (await getSalesStats(db)) as {
+    total_transactions?: number;
+    total_revenue_inr?: string;
+    average_order_value_inr?: string;
+  };
+  const fingerprint = sha256(
+    JSON.stringify(
+      products.map((p) => ({
+        id: p.id,
+        name: p.name,
+        price_cents: p.price_cents,
+        available: p.available,
+        dietary_classification: p.dietary_classification,
+      }))
+    )
+  );
+  return {
+    product_count: products.length,
+    product_fingerprint: fingerprint,
+    transaction_count: stats.total_transactions ?? null,
+    total_revenue_inr: stats.total_revenue_inr ?? null,
+    average_order_value_inr: stats.average_order_value_inr ?? null,
+  };
+}
+
+interface CaseArgs {
   db: any;
   config: EnvConfig;
-  baseUrl: string;
-  adminToken: string | undefined;
+  serverStatus: ServerStatus;
   c: DatasetCase;
-}): Promise<unknown> {
-  const start = Date.now();
-  let actualResponse = "";
-  let httpStatus: number | null = null;
-  let error: string | null = null;
-  let simulated = false;
-  const effectiveMode = config.groundingMode || c.groundingMode || "retrieval_validation";
+}
 
-  try {
-    const res = await fetch(`${baseUrl}/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(adminToken ? { Authorization: `Bearer ${adminToken}` } : {}),
-      },
-      body: JSON.stringify({
-        message: c.question,
-        grounding: effectiveMode,
-      }),
+async function runCase({ db, config, serverStatus, c }: CaseArgs): Promise<Record<string, unknown>> {
+  const start = Date.now();
+  const requested = config.mode;
+  const simulated = config.provider === "demo" || serverStatus.provider === "demo";
+  let precedingResponse: string | null = null;
+  let precedingStatus: number | null = null;
+  let precedingGrounding: string | null = null;
+  let conversationId: string | undefined;
+  let turn: ChatTurn;
+
+  if (c.precedingQuestion) {
+    const first = await postChat({
+      config,
+      message: c.precedingQuestion,
+      grounding: requested,
     });
-    httpStatus = res.status;
-    const body = await res.json();
-    actualResponse = (body as any)?.reply ?? "";
-    if (!res.ok) error = `HTTP ${res.status}`;
-  } catch (err) {
-    error = err instanceof Error ? err.message : String(err);
+    precedingResponse = first.body?.reply ?? null;
+    precedingStatus = first.status;
+    precedingGrounding = first.body?.grounding_mode ?? null;
+    conversationId = first.body?.conversation_id;
+    if (first.error || first.status !== 200 || !first.body?.reply || !conversationId) {
+      return buildRecord({
+        c,
+        config,
+        serverStatus,
+        simulated,
+        requested,
+        returned: precedingGrounding,
+        actualResponse: precedingResponse ?? "",
+        precedingResponse,
+        precedingStatus,
+        precedingGrounding,
+        promptVersion: first.body?.prompt_version ?? null,
+        httpStatus: first.status,
+        error: first.error ?? "Follow-up setup turn did not return a reply/conversation_id.",
+        attempts: first.attempts,
+        latencyMs: Date.now() - start,
+        valid: false,
+        validityReason: "Follow-up setup turn failed; the case cannot test context retention.",
+        outcome: "error",
+      });
+    }
+    turn = await postChat({
+      config,
+      message: c.question,
+      grounding: requested,
+      conversationId,
+    });
+  } else {
+    turn = await postChat({ config, message: c.question, grounding: requested });
   }
 
-  let outcome: "pass" | "fail" | "unverified" | "error" = "unverified";
-  if (error) {
-    outcome = "error";
-  } else {
+  const returned = turn.body?.grounding_mode ?? null;
+  const promptVersion = turn.body?.prompt_version ?? null;
+  const actualResponse = turn.body?.reply ?? "";
+
+  let valid = true;
+  let validityReason: string | null = null;
+  if (turn.error) {
+    valid = false;
+    validityReason = turn.error;
+  } else if (turn.status !== 200) {
+    valid = false;
+    validityReason = `HTTP ${turn.status}`;
+  } else if (!actualResponse) {
+    valid = false;
+    validityReason = "Server returned an empty reply.";
+  } else if (returned !== requested) {
+    valid = false;
+    validityReason = `Server used grounding mode ${String(returned)}, requested ${requested}.`;
+  } else if (!promptVersion) {
+    valid = false;
+    validityReason = "Server did not report prompt_version.";
+  } else if (c.precedingQuestion && precedingGrounding !== requested) {
+    valid = false;
+    validityReason = `Follow-up setup used grounding mode ${String(precedingGrounding)}, requested ${requested}.`;
+  } else if (simulated) {
+    valid = false;
+    validityReason = "Demo provider output is tooling evidence, not a genuine model trial.";
+  }
+
+  let outcome: "pass" | "fail" | "unverified" | "error" = valid ? "unverified" : simulated ? "unverified" : "error";
+  if (valid) {
     const factual = await checkFactual(db, actualResponse);
-    const pricesMentioned = extractPricesWithPositions(actualResponse).length > 0;
-    if (factual.constraint) {
+    const constraint = await checkConstraint(db, c, actualResponse);
+    const failure = factual.constraint ? factual : constraint;
+    if (failure.constraint) {
       outcome = "fail";
-    } else if (pricesMentioned) {
-      // The model made a verifiable price claim and it checked out.
+    } else if (extractPricesWithPositions(actualResponse).length > 0) {
       outcome = "pass";
     }
-    // Otherwise leave as "unverified" for manual review.
   }
 
-  const latencyMs = Date.now() - start;
-  const record = {
+  return buildRecord({
+    c,
+    config,
+    serverStatus,
+    simulated,
+    requested,
+    returned,
+    actualResponse,
+    precedingResponse,
+    precedingStatus,
+    precedingGrounding,
+    promptVersion,
+    httpStatus: turn.status,
+    error: turn.error,
+    attempts: turn.attempts,
+    latencyMs: Date.now() - start,
+    valid,
+    validityReason,
+    outcome,
+  });
+}
+
+function buildRecord({
+  c,
+  config,
+  serverStatus,
+  simulated,
+  requested,
+  returned,
+  actualResponse,
+  precedingResponse,
+  precedingStatus,
+  precedingGrounding,
+  promptVersion,
+  httpStatus,
+  error,
+  attempts,
+  latencyMs,
+  valid,
+  validityReason,
+  outcome,
+}: {
+  c: DatasetCase;
+  config: EnvConfig;
+  serverStatus: ServerStatus;
+  simulated: boolean;
+  requested: string;
+  returned: string | null;
+  actualResponse: string;
+  precedingResponse?: string | null;
+  precedingStatus?: number | null;
+  precedingGrounding?: string | null;
+  promptVersion: string | null;
+  httpStatus: number | null;
+  error: string | null;
+  attempts: number;
+  latencyMs: number;
+  valid: boolean;
+  validityReason: string | null;
+  outcome: "pass" | "fail" | "unverified" | "error";
+}): Record<string, unknown> {
+  return {
     runId: (globalThis as any).__CAFE_RUN_ID,
     datasetVersion: (globalThis as any).__CAFE_DATASET_VERSION,
-    experimentalConfig: c.groundingMode,
-    model: config.model,
-    provider: config.provider,
+    setName: c.setName ?? null,
+    experimentalConfig: config.configId,
+    model: serverStatus.model,
+    provider: serverStatus.provider,
     simulated,
     testId: c.id,
     category: c.category,
     question: c.question,
-    groundingMode: effectiveMode,
+    precedingQuestion: c.precedingQuestion ?? null,
+    precedingResponse: precedingResponse ?? null,
+    precedingHttpStatus: precedingStatus ?? null,
+    precedingGrounding: precedingGrounding ?? null,
+    requestedGrounding: requested,
+    groundingMode: requested,
+    returnedGrounding: returned,
+    promptVersion: promptVersion ?? "unknown",
+    generationParameters: serverStatus.generation_parameters,
     expectedOutcome: c.expectedOutcome,
     failureCategory: c.failureCategory,
     actualResponse,
     latencyMs,
     httpStatus,
     error,
+    attempts,
+    valid,
+    validityReason,
     outcome,
     tokenConsumption: "unknown",
     timestamp: nowIso(),
   };
-  return record;
-}
-
-async function delayWithJitter(ms: number): Promise<void> {
-  await sleep(ms + Math.floor(Math.random() * 300));
-}
-
-async function runWithRetry(
-  fn: () => Promise<unknown>,
-  config: EnvConfig
-): Promise<unknown> {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      const msg = String(err);
-      // Do not retry authentication/credential errors.
-      if (msg.includes("401") || msg.includes("403")) throw err;
-      // Retry transient failures (429, network) up to maxRetries.
-      if (attempt < config.maxRetries && (msg.includes("429") || msg.includes("fetch") || msg.includes("ECONNREFUSED"))) {
-        await delayWithJitter(config.retryDelayMs * (attempt + 1));
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw lastError;
 }
 
 async function main(): Promise<void> {
   const config = envConfig();
   const dataset = loadDataset();
-  (globalThis as any).__CAFE_RUN_ID = `cafe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const runId = `cafe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  (globalThis as any).__CAFE_RUN_ID = runId;
   (globalThis as any).__CAFE_DATASET_VERSION = dataset.schemaVersion;
 
-  // Build the case list from the selected sets.
+  const serverStatus = await preflight(config);
+
   let cases: DatasetCase[] = [];
   for (const setName of config.sets) {
-    cases = cases.concat((dataset.sets as any)[setName] || []);
+    const set = (dataset.sets as Record<string, DatasetCase[]>)[setName];
+    if (!set) throw new Error(`Unknown dataset set "${setName}". Use dev and/or heldOut.`);
+    cases = cases.concat(set.map((c) => ({ ...c, setName })));
   }
   if (config.categories && config.categories.length) {
     cases = cases.filter((c) => config.categories!.includes(c.category));
   }
 
   const db = await createTestDb();
-
-  const completed = loadCompletedIds(config.resultsFile);
+  const snapshot = await snapshotDb(db);
+  const completed = loadCompletedIds(config.resultsFile, config.configId);
   const pending = cases.filter((c) => !completed.has(c.id));
-  const batch = config.batchSize && config.batchSize > 0 ? pending.slice(0, config.batchSize) : pending;
+  const batch = config.batchSize > 0 ? pending.slice(0, config.batchSize) : pending;
 
-  console.log(`Café Fernweh evaluation runner`);
-  console.log(`  runId: ${(globalThis as any).__CAFE_RUN_ID}`);
+  console.log("Café Fernweh evaluation runner");
+  console.log(`  runId: ${runId}`);
   console.log(`  datasetVersion: ${dataset.schemaVersion}`);
-  console.log(`  provider: ${config.provider} model: ${config.model}`);
+  console.log(`  config: ${config.configId} (${config.mode})`);
+  console.log(`  server: ${serverStatus.provider} model: ${serverStatus.model}`);
+  console.log(`  promptVersion: ${serverStatus.prompt_version}`);
   console.log(`  sets: ${config.sets.join(",")} categories: ${config.categories?.join(",") || "all"}`);
-  console.log(`  cases: ${cases.length} total, ${pending.length} pending, ${batch.length} in this batch`);
-  console.log(`  concurrency: ${config.concurrency} pacing: ${config.pacingMs}ms maxRetries: ${config.maxRetries}`);
+  console.log(`  cases: ${cases.length} total, ${completed.size} completed for this config, ${pending.length} pending, ${batch.length} in this batch`);
+  console.log(`  sequential execution, pacing ${config.pacingMs}ms, maxRetries ${config.maxRetries}`);
   console.log(`  results: ${config.resultsFile}`);
 
-  let pass = 0, fail = 0, unverified = 0, errors = 0;
+  appendRecord(config.resultsFile, {
+    testId: "MANIFEST",
+    category: "manifest",
+    runId,
+    datasetVersion: dataset.schemaVersion,
+    experimentalConfig: config.configId,
+    groundingMode: config.mode,
+    provider: serverStatus.provider,
+    model: serverStatus.model,
+    promptVersion: serverStatus.prompt_version,
+    generationParameters: serverStatus.generation_parameters,
+    simulated: serverStatus.provider === "demo",
+    dbSnapshot: snapshot,
+    selectedSets: config.sets,
+    caseIds: batch.map((c) => c.id),
+    timestamp: nowIso(),
+  });
+
+  let pass = 0;
+  let fail = 0;
+  let unverified = 0;
+  let errors = 0;
+  let validCount = 0;
+  let invalidCount = 0;
+  let consecutiveErrors = 0;
 
   for (const c of batch) {
-    let record: unknown;
+    let record: Record<string, unknown>;
     try {
-      record = await runWithRetry(() => runCase({ db, config, baseUrl: config.baseUrl, adminToken: config.adminToken, c }), config);
+      record = await runCase({ db, config, serverStatus, c });
     } catch (err) {
-      const start = Date.now();
       record = {
-        runId: (globalThis as any).__CAFE_RUN_ID,
+        runId,
         datasetVersion: dataset.schemaVersion,
-        experimentalConfig: c.groundingMode,
-        model: config.model,
-        provider: config.provider,
-        simulated: false,
+        setName: c.setName ?? null,
+        experimentalConfig: config.configId,
+        model: serverStatus.model,
+        provider: serverStatus.provider,
+        simulated: serverStatus.provider === "demo",
         testId: c.id,
         category: c.category,
         question: c.question,
-        groundingMode: c.groundingMode,
+        precedingQuestion: c.precedingQuestion ?? null,
+        requestedGrounding: config.mode,
+        groundingMode: config.mode,
+        returnedGrounding: null,
+        promptVersion: serverStatus.prompt_version,
+        generationParameters: serverStatus.generation_parameters,
         expectedOutcome: c.expectedOutcome,
         failureCategory: c.failureCategory,
         actualResponse: "",
-        latencyMs: Date.now() - start,
+        latencyMs: 0,
         httpStatus: null,
         error: err instanceof Error ? err.message : String(err),
+        attempts: 0,
+        valid: false,
+        validityReason: "Runner exception before a complete record was produced.",
         outcome: "error",
         tokenConsumption: "unknown",
         timestamp: nowIso(),
@@ -352,30 +744,68 @@ async function main(): Promise<void> {
     }
 
     appendRecord(config.resultsFile, record);
-    const r = record as { outcome: string; latencyMs: number; testId: string; category: string };
+    const r = record as {
+      outcome: string;
+      latencyMs: number;
+      testId: string;
+      category: string;
+      valid: boolean;
+      validityReason: string | null;
+      attempts: number;
+    };
+    if (r.valid) validCount++;
+    else invalidCount++;
     if (r.outcome === "pass") pass++;
     else if (r.outcome === "fail") fail++;
     else if (r.outcome === "error") errors++;
     else unverified++;
-    console.log(`  ${c.id} [${c.category}] ${r.outcome} (${r.latencyMs}ms)`);
+    console.log(
+      `  ${c.id} [${c.category}] ${r.outcome}${r.valid ? "" : ` (invalid: ${r.validityReason})`} (${r.latencyMs}ms, attempts=${r.attempts})`
+    );
 
-    if (config.concurrency === 1) {
-      await delayWithJitter(config.pacingMs);
+    const errored = r.outcome === "error" && !(record as { simulated?: boolean }).simulated;
+    consecutiveErrors = errored ? consecutiveErrors + 1 : 0;
+    if (consecutiveErrors >= config.maxConsecutiveErrors) {
+      appendRecord(config.resultsFile, {
+        testId: "ABORT",
+        category: "abort",
+        runId,
+        reason: `Aborted after ${consecutiveErrors} consecutive errors; quota or server availability may be exhausted.`,
+        timestamp: nowIso(),
+      });
+      console.error(
+        `Aborting run after ${consecutiveErrors} consecutive errors. Do not retry repeatedly; check quota/server status first.`
+      );
+      break;
     }
+
+    await delayWithJitter(config.pacingMs);
   }
 
   const summary = {
-    runId: (globalThis as any).__CAFE_RUN_ID,
+    testId: "SUMMARY",
+    category: "summary",
+    runId,
     datasetVersion: dataset.schemaVersion,
+    experimentalConfig: config.configId,
+    groundingMode: config.mode,
     totalCases: cases.length,
     runCases: batch.length,
-    pass, fail, unverified, errors,
-    provider: config.provider,
-    model: config.model,
+    pass,
+    fail,
+    unverified,
+    errors,
+    valid: validCount,
+    invalid: invalidCount,
+    provider: serverStatus.provider,
+    model: serverStatus.model,
+    promptVersion: serverStatus.prompt_version,
     timestamp: nowIso(),
   };
-  appendRecord(config.resultsFile, { ...summary, testId: "SUMMARY", category: "summary" });
-  console.log(`\nRun complete: pass=${pass} fail=${fail} unverified=${unverified} errors=${errors}`);
+  appendRecord(config.resultsFile, summary);
+  console.log(
+    `\nRun complete: pass=${pass} fail=${fail} unverified=${unverified} errors=${errors} valid=${validCount} invalid=${invalidCount}`
+  );
   console.log(`Results appended to ${config.resultsFile}`);
 }
 
