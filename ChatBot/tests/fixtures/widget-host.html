@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Acme Bakery — independent widget host fixture</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 32px;
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f4f1ea;
+        color: #222;
+      }
+      h1 { font-size: 2rem; margin-top: 0; }
+      /* Deliberately hostile global rules. Shadow DOM must protect the widget. */
+      div { color: rgb(255, 0, 0); background: rgb(255, 255, 0); }
+      button { all: unset; }
+      #host-probe { width: 180px; height: 44px; padding: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>Acme Bakery</h1>
+    <p>
+      This page represents an unrelated website embedding the Café Fernweh chat
+      widget. It exists only inside the chatbot test suite.
+    </p>
+    <div id="host-probe">Host content (host CSS must not leak into the widget)</div>
+
+    <cafe-chatbot api-base="http://127.0.0.1:8787"></cafe-chatbot>
+    <script src="http://127.0.0.1:8787/widget/cafe-chatbot-widget.iife.js"></script>
+  </body>
+</html>

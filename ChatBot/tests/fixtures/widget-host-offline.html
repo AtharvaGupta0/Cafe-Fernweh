@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Acme Bakery — widget error-handling fixture</title>
+    <style>
+      body { margin: 0; padding: 32px; font-family: Georgia, serif; background: #f4f1ea; }
+    </style>
+  </head>
+  <body>
+    <h1>Acme Bakery</h1>
+    <p>This fixture points the widget at an unreachable backend to test error handling.</p>
+
+    <cafe-chatbot api-base="http://127.0.0.1:9"></cafe-chatbot>
+    <script src="http://127.0.0.1:8787/widget/cafe-chatbot-widget.iife.js"></script>
+  </body>
+</html>
