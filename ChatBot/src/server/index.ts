@@ -7,6 +7,25 @@ import { wrapD1, wrapSqlJs, type D1Database, execStatements, readOne } from "./l
 import { SCHEMA_SQL, SEED_SQL } from "./lib/init-sql";
 import { runConversation, escapeHtml } from "./lib/orchestration";
 import { createConversationState, type ConversationState } from "./lib/state";
+import {
+  listProductsAdmin,
+  getProductAdmin,
+  upsertProductAdmin,
+  deleteProductAdmin,
+  listSalesAdmin,
+  salesStatsAdmin,
+  type AdminProductInput,
+} from "./lib/admin";
+import {
+  verifyToken,
+  createSession,
+  getSession,
+  destroySession,
+  sessionIdFromCookie,
+  adminSessionCookie,
+  clearAdminSessionCookie,
+  hashToken,
+} from "./lib/admin-auth";
 import { createProvider, getInferenceConfigFromEnv } from "./inference";
 import { chatRequestSchema, type ChatResponse, type GroundingMode } from "@shared/schema";
 
@@ -20,6 +39,7 @@ interface Env {
   MAX_MESSAGE_LENGTH?: string;
   CORS_ALLOW_ORIGINS?: string;
   DEV_ADMIN_TOKEN?: string;
+  ADMIN_TOKEN?: string;
 }
 
 const DEFAULT_MAX_MESSAGE_LENGTH = 2000;
@@ -223,6 +243,69 @@ export default {
         products,
       };
       return c.json({ ...response, conversation_id: id });
+    });
+
+    // ---- Admin routes (protected) ----
+    function requireAdmin(c: any): { sessionId: string } | never {
+      const sessionId = sessionIdFromCookie(c.req.header("Cookie") ?? null);
+      if (!sessionId || !getSession(sessionId)) {
+        throw new HTTPException(401, { message: "Admin authentication required." });
+      }
+      return { sessionId };
+    }
+
+    app.post("/admin/login", async (c) => {
+      const body = await c.req.json<{ token?: unknown }>();
+      const token = typeof body?.token === "string" ? body.token : "";
+      const stored = env.ADMIN_TOKEN;
+      if (!stored || !verifyToken(token, hashToken(stored))) {
+        throw new HTTPException(401, { message: "Invalid admin token." });
+      }
+      const sessionId = createSession(token, 3600_000);
+      return c.json({ ok: true }, 200, { "Set-Cookie": adminSessionCookie(sessionId) });
+    });
+
+    app.post("/admin/logout", (c) => {
+      const sessionId = sessionIdFromCookie(c.req.header("Cookie"));
+      if (sessionId) destroySession(sessionId);
+      return c.json({ ok: true }, 200, { "Set-Cookie": clearAdminSessionCookie() });
+    });
+
+    app.get("/admin/menu", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const products = await listProductsAdmin(db as any);
+      return c.json({ products });
+    });
+
+    app.post("/admin/menu", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const input = await c.req.json<AdminProductInput>();
+      const result = await upsertProductAdmin(db as any, input);
+      return c.json(result);
+    });
+
+    app.delete("/admin/menu/:id", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const id = Number(c.req.param("id"));
+      await deleteProductAdmin(db as any, id);
+      return c.json({ id });
+    });
+
+    app.get("/admin/sales", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const [list, stats] = await Promise.all([
+        listSalesAdmin(db as any),
+        salesStatsAdmin(db as any),
+      ]);
+      return c.json({ list, stats });
     });
 
     app.onError((err, c) => {

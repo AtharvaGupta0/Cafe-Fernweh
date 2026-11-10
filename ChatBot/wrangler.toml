@@ -10,6 +10,7 @@ AI_REQUEST_TIMEOUT_MS = "30000"
 MAX_CONVERSATION_TURNS = "10"
 MAX_MESSAGE_LENGTH = "2000"
 CORS_ALLOW_ORIGINS = "http://localhost:5173"
+ADMIN_TOKEN = ""
 
 # D1 database binding. For local development run: wrangler dev --local
 # (creates a local D1). For deployment, set a real database_id.
