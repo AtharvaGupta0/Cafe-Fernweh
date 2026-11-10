@@ -128,8 +128,15 @@ async function ensureInitialized(db: ReturnType<typeof getDatabase>): Promise<vo
   if (dbInitPromise) return dbInitPromise;
   dbInitPromise = (async () => {
     try {
-      const row = (await readOne(db, "SELECT COUNT(*) AS c FROM categories") as { c?: unknown } | null);
-      if (Number(row?.c ?? 0) > 0) return;
+      let alreadySeeded = false;
+      try {
+        const row = (await readOne(db, "SELECT COUNT(*) AS c FROM categories") as { c?: unknown } | null);
+        alreadySeeded = Number(row?.c ?? 0) > 0;
+      } catch {
+        // Tables do not exist yet (fresh D1); treat as not seeded.
+        alreadySeeded = false;
+      }
+      if (alreadySeeded) return;
       await execStatements(db as any, SCHEMA_SQL);
       await execStatements(db as any, SEED_SQL);
     } catch {

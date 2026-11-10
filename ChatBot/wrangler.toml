@@ -2,6 +2,8 @@ name = "cafe-fernweh"
 main = "src/server/index.ts"
 compatibility_date = "2024-11-01"
 
+compatibility_flags = ["nodejs_compat"]
+
 # Defaults for local development. Override with `wrangler --env` or .env.
 [vars]
 AI_PROVIDER = "demo"
@@ -18,12 +20,6 @@ ADMIN_TOKEN = ""
 binding = "DB"
 database_name = "cafe-fernweh"
 database_id = ""
-
-# Static assets: customer chat, admin dashboard and widget are served from the
-# same origin as the API so HttpOnly session cookies work across dev and prod.
-[[assets]]
-binding = "ASSETS"
-directory = "public"
 
 [observability]
 enabled = true
