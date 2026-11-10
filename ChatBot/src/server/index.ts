@@ -36,8 +36,7 @@ import {
   clearAdminSessionCookie,
   csrfTokenCookie,
   clearCsrfTokenCookie,
-  generateCsrfToken,
-  validateCsrf,
+  validateSessionCsrf,
   hashToken,
 } from "./lib/admin-auth";
 import { createProvider, getInferenceConfigFromEnv } from "./inference";
@@ -55,6 +54,7 @@ interface Env {
   CORS_ALLOW_ORIGINS?: string;
   DEV_ADMIN_TOKEN?: string;
   ADMIN_TOKEN?: string;
+  SEED_DEMO_DATA?: string;
 }
 
 const DEFAULT_MAX_MESSAGE_LENGTH = 2000;
@@ -69,7 +69,12 @@ const API_ROUTES = [
   "/bestsellers",
   "/sales-stats",
   "/chat",
-  "/admin",
+  "/admin/login",
+  "/admin/logout",
+  "/admin/menu",
+  "/admin/sales",
+  "/admin/ingredients",
+  "/admin/allergens",
 ];
 function isApiRoute(pathname: string): boolean {
   return API_ROUTES.some(
@@ -101,6 +106,34 @@ function allowRequest(ip: string, endpoint: string, limit: number, windowMs: num
   return true;
 }
 
+// Dedicated login throttle: 5 failed attempts per IP per 5 minutes. Like the
+// general limiter this is per Worker isolate, so it slows brute force but is
+// not a globally distributed lockout. See SECURITY.md.
+const loginFailures = new Map<string, { count: number; resetAt: number }>();
+const LOGIN_WINDOW_MS = 5 * 60_000;
+const LOGIN_MAX_FAILURES = 5;
+function loginAllowed(ip: string): boolean {
+  const entry = loginFailures.get(ip);
+  if (!entry) return true;
+  if (Date.now() > entry.resetAt) {
+    loginFailures.delete(ip);
+    return true;
+  }
+  return entry.count < LOGIN_MAX_FAILURES;
+}
+function recordLoginFailure(ip: string): void {
+  const now = Date.now();
+  const entry = loginFailures.get(ip);
+  if (!entry || now > entry.resetAt) {
+    loginFailures.set(ip, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+  } else {
+    entry.count += 1;
+  }
+}
+function clearLoginFailures(ip: string): void {
+  loginFailures.delete(ip);
+}
+
 function getCorsOrigins(env: Env): string[] {
   const raw = env.CORS_ALLOW_ORIGINS || "http://localhost:5173";
   return raw.split(",").map((o) => o.trim()).filter(Boolean);
@@ -122,29 +155,52 @@ function getDatabase(env: Env) {
   }
 }
 
-let dbInitPromise: Promise<void> | null = null;
-async function ensureInitialized(db: ReturnType<typeof getDatabase>): Promise<void> {
+let dbSchemaPromise: Promise<void> | null = null;
+let dbSeedPromise: Promise<void> | null = null;
+
+/**
+ * Create the schema if needed. Demo menu/sales data is only inserted when
+ * SEED_DEMO_DATA is explicitly enabled (local development); production
+ * databases must be provisioned and seeded deliberately, never automatically.
+ */
+async function ensureInitialized(
+  db: ReturnType<typeof getDatabase>,
+  seedDemoData: boolean
+): Promise<void> {
   if (!db) return;
-  if (dbInitPromise) return dbInitPromise;
-  dbInitPromise = (async () => {
-    try {
-      let alreadySeeded = false;
+  if (!dbSchemaPromise) {
+    dbSchemaPromise = (async () => {
       try {
-        const row = (await readOne(db, "SELECT COUNT(*) AS c FROM categories") as { c?: unknown } | null);
-        alreadySeeded = Number(row?.c ?? 0) > 0;
+        await execStatements(db as any, SCHEMA_SQL);
       } catch {
-        // Tables do not exist yet (fresh D1); treat as not seeded.
-        alreadySeeded = false;
+        // Best-effort initialization; endpoints will report if the DB is not ready.
       }
-      if (alreadySeeded) return;
-      await execStatements(db as any, SCHEMA_SQL);
-      await execStatements(db as any, SEED_SQL);
-    } catch {
-      // Best-effort initialization; endpoints will report if the DB is not ready.
-    }
-  })();
-  return dbInitPromise;
+    })();
+  }
+  await dbSchemaPromise;
+
+  if (!seedDemoData) return;
+  if (!dbSeedPromise) {
+    dbSeedPromise = (async () => {
+      try {
+        const row = (await readOne(db, "SELECT COUNT(*) AS c FROM categories")) as { c?: unknown } | null;
+        if (Number(row?.c ?? 0) === 0) {
+          await execStatements(db as any, SEED_SQL);
+        }
+      } catch {
+        // Seeding is best effort and never runs in production by default.
+      }
+    })();
+  }
+  await dbSeedPromise;
 }
+
+async function getReadyDatabase(env: Env) {
+  const db = getDatabase(env);
+  await ensureInitialized(db, env.SEED_DEMO_DATA === "true");
+  return db;
+}
+
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -179,8 +235,7 @@ export default {
     app.get("/health", (c) => c.json({ status: "ok", service: "cafe-fernweh" }));
 
     app.get("/menu", async (c) => {
-      const db = getDatabase(env);
-      await ensureInitialized(db as any);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { searchProducts } = await import("./lib/menu");
@@ -189,8 +244,7 @@ export default {
     });
 
     app.get("/menu/:id", async (c) => {
-      const db = getDatabase(env);
-      await ensureInitialized(db as any);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const { getProduct } = await import("./lib/menu");
       const id = Number(c.req.param("id"));
@@ -200,8 +254,7 @@ export default {
     });
 
     app.get("/bestsellers", async (c) => {
-      const db = getDatabase(env);
-      await ensureInitialized(db as any);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const { getBestsellers } = await import("./lib/menu");
       const items = await getBestsellers(db as any, 10);
@@ -209,16 +262,14 @@ export default {
     });
 
     app.get("/sales-stats", async (c) => {
-      const db = getDatabase(env);
-      await ensureInitialized(db as any);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const { getSalesStats } = await import("./lib/menu");
       return c.json({ stats: await getSalesStats(db as any) });
     });
 
     app.post("/chat", async (c) => {
-      const db = getDatabase(env);
-      await ensureInitialized(db as any);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
 
       const raw = await c.req.json<{ message?: unknown; conversation_id?: unknown; grounding?: unknown }>();
@@ -308,24 +359,36 @@ export default {
       return c.req.url.startsWith("https://");
     }
 
-    /** Require a valid double-submit CSRF token on state-changing requests. */
+    /**
+     * Require a valid CSRF token on state-changing requests. The token must
+     * match both the readable cookie (double submit) and the hash bound to the
+     * authenticated server-side session.
+     */
     function requireCsrf(c: any): void {
+      const cookieHeader = c.req.header("Cookie") ?? null;
+      const sessionId = sessionIdFromCookie(cookieHeader);
       const headerToken = c.req.header("X-CSRF-Token") ?? null;
-      if (!validateCsrf(c.req.header("Cookie") ?? null, headerToken)) {
+      if (!sessionId || !validateSessionCsrf(sessionId, cookieHeader, headerToken)) {
         throw new HTTPException(403, { message: "Invalid or missing CSRF token." });
       }
     }
 
     app.post("/admin/login", async (c) => {
+      const ip = c.req.header("CF-Connecting-IP") || "unknown";
+      if (!loginAllowed(ip)) {
+        c.header("Retry-After", "300");
+        throw new HTTPException(429, { message: "Too many login attempts. Try again later." });
+      }
       const body = await c.req.json<{ token?: unknown }>();
       const token = typeof body?.token === "string" ? body.token : "";
       const stored = env.ADMIN_TOKEN;
       if (!stored || !verifyToken(token, hashToken(stored))) {
+        recordLoginFailure(ip);
         throw new HTTPException(401, { message: "Invalid admin token." });
       }
+      clearLoginFailures(ip);
       const secure = isSecure(c);
-      const sessionId = createSession(token, 3600_000);
-      const csrfToken = generateCsrfToken();
+      const { sessionId, csrfToken } = createSession(token, 3600_000);
       return c.json(
         { ok: true },
         200,
@@ -357,7 +420,7 @@ export default {
 
     app.get("/admin/menu", async (c) => {
       requireAdmin(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const products = await listProductsAdmin(db as any);
       return c.json({ products });
@@ -366,7 +429,7 @@ export default {
     app.post("/admin/menu", async (c) => {
       requireAdmin(c);
       requireCsrf(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const input = await c.req.json<AdminProductInput>();
       const result = await upsertProductAdmin(db as any, input);
@@ -376,7 +439,7 @@ export default {
     app.delete("/admin/menu/:id", async (c) => {
       requireAdmin(c);
       requireCsrf(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const id = Number(c.req.param("id"));
       await deleteProductAdmin(db as any, id);
@@ -385,7 +448,7 @@ export default {
 
     app.get("/admin/sales", async (c) => {
       requireAdmin(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const [list, stats] = await Promise.all([
         listSalesAdmin(db as any),
@@ -397,7 +460,7 @@ export default {
     app.post("/admin/sales", async (c) => {
       requireAdmin(c);
       requireCsrf(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const input = await c.req.json<{ items: Array<{ product_id: number; quantity: number; unit_price_cents: number }> }>();
       const result = await recordSaleAdmin(db as any, input);
@@ -407,7 +470,7 @@ export default {
     app.post("/admin/sales/import", async (c) => {
       requireAdmin(c);
       requireCsrf(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const body = await c.req.json<{ csv?: unknown }>();
       const csv = typeof body?.csv === "string" ? body.csv : "";
@@ -421,7 +484,7 @@ export default {
 
     app.get("/admin/ingredients", async (c) => {
       requireAdmin(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const ingredients = await listIngredients(db as any);
       return c.json({ ingredients });
@@ -429,7 +492,7 @@ export default {
 
     app.get("/admin/allergens", async (c) => {
       requireAdmin(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const allergens = await listAllergens(db as any);
       return c.json({ allergens });
@@ -437,7 +500,7 @@ export default {
 
     app.get("/admin/menu/:id/ingredients", async (c) => {
       requireAdmin(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const id = Number(c.req.param("id"));
       const ingredients = await listProductIngredients(db as any, id);
@@ -447,7 +510,7 @@ export default {
     app.put("/admin/menu/:id/ingredients", async (c) => {
       requireAdmin(c);
       requireCsrf(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const id = Number(c.req.param("id"));
       const body = await c.req.json<{ ingredient_ids?: unknown }>();
@@ -461,7 +524,7 @@ export default {
 
     app.get("/admin/menu/:id/allergens", async (c) => {
       requireAdmin(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const id = Number(c.req.param("id"));
       const allergens = await listProductAllergens(db as any, id);
@@ -471,7 +534,7 @@ export default {
     app.put("/admin/menu/:id/allergens/:allergenId/verified", async (c) => {
       requireAdmin(c);
       requireCsrf(c);
-      const db = getDatabase(env);
+      const db = await getReadyDatabase(env);
       if (!db) throw new HTTPException(503, { message: "Database not available." });
       const id = Number(c.req.param("id"));
       const allergenId = Number(c.req.param("allergenId"));
@@ -493,7 +556,7 @@ export default {
 
     // API routes are handled by the Hono app; everything else is served as a
     // static asset from the same origin (customer chat, admin dashboard,
-    // widget). Assets are bound via wrangler [[assets]].
+    // widget). Assets are bound via wrangler [assets].
     if (isApiRoute(new URL(request.url).pathname)) {
       return app.fetch(request, env);
     }

@@ -5,15 +5,22 @@
  * Credentials are verified server-side; nothing secret reaches the browser.
  * Sessions are in-memory (sufficient for a single Worker deployment; not
  * globally reliable across Cloudflare Worker isolates).
+ *
+ * CSRF uses a double-submit cookie that is additionally bound to the server
+ * side session: the session stores a hash of the CSRF token issued at login,
+ * and state-changing requests must present the same token in the readable
+ * cookie and the X-CSRF-Token header. This prevents a token minted for one
+ * session from being replayed against another.
  */
 
-import { createHash, timingSafeEqual } from "crypto";
+import { createHash, randomBytes, timingSafeEqual } from "crypto";
 import { z } from "zod";
 
 const ADMIN_TOKEN_SCHEMA = z.string().min(1);
 
 interface AdminSession {
   tokenHash: string;
+  csrfTokenHash: string;
   createdAt: number;
   ttlMs: number;
 }
@@ -47,18 +54,22 @@ export function verifyToken(candidate: string, storedHash: string): boolean {
 
 /**
  * Create a session for a verified admin token. Returns a session id to be
- * set as an HttpOnly, SameSite cookie by the caller.
+ * set as an HttpOnly, SameSite cookie by the caller, plus the CSRF token that
+ * is bound to that session.
  */
-export function createSession(token: string, ttlMs: number): string {
-  const sessionId = createHash("sha256")
-    .update(`${token}${Date.now()}${Math.random()}`)
-    .digest("hex");
+export function createSession(
+  token: string,
+  ttlMs: number
+): { sessionId: string; csrfToken: string } {
+  const sessionId = randomBytes(32).toString("hex");
+  const csrfToken = randomBytes(32).toString("hex");
   sessions.set(sessionId, {
     tokenHash: hashToken(token),
+    csrfTokenHash: hashToken(csrfToken),
     createdAt: Date.now(),
     ttlMs,
   });
-  return sessionId;
+  return { sessionId, csrfToken };
 }
 
 /**
@@ -81,13 +92,25 @@ export function destroySession(sessionId: string): void {
   sessions.delete(sessionId);
 }
 
+function cookieValue(
+  cookieHeader: string | null | undefined,
+  name: string
+): string | null {
+  if (!cookieHeader) return null;
+  const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  return match ? (match[1] ?? null) : null;
+}
+
 /**
  * Parse the session id from a Cookie header. Returns null when missing.
  */
 export function sessionIdFromCookie(cookieHeader: string | null | undefined): string | null {
-  if (!cookieHeader) return null;
-  const match = cookieHeader.match(/(?:^|;\s*)cafe_session=([^;]+)/);
-  return match ? (match[1] ?? null) : null;
+  return cookieValue(cookieHeader, "cafe_session");
+}
+
+/** Parse the CSRF token from a Cookie header. */
+export function csrfTokenFromCookie(cookieHeader: string | null | undefined): string | null {
+  return cookieValue(cookieHeader, "csrf_token");
 }
 
 /** Build a Set-Cookie header for the admin session. */
@@ -110,33 +133,47 @@ export function clearCsrfTokenCookie(secure: boolean): string {
   return `csrf_token=; Path=/; SameSite=Lax; Max-Age=0${secure ? "; Secure" : ""}`;
 }
 
-/** Generate a random double-submit CSRF token. */
+/** Generate a random CSRF token. */
 export function generateCsrfToken(): string {
-  return createHash("sha256")
-    .update(`${Date.now()}${Math.random()}`)
-    .digest("hex");
+  return randomBytes(32).toString("hex");
 }
 
 /**
- * Verify the double-submit CSRF token: the X-CSRF-Token header must match the
- * csrf_token cookie value. Returns false when either is missing or they differ.
+ * Verify the double-submit part of CSRF protection: the X-CSRF-Token header
+ * must match the csrf_token cookie value. Returns false when either is missing
+ * or they differ.
  */
 export function validateCsrf(
   cookieHeader: string | null | undefined,
   headerToken: string | null | undefined
 ): boolean {
   if (!headerToken) return false;
-  const cookieToken = sessionIdFromCookie(cookieHeader);
-  // sessionIdFromCookie looks for cafe_session; reuse the pattern for csrf_token.
-  const csrfMatch = cookieHeader
-    ? cookieHeader.match(/(?:^|;\s*)csrf_token=([^;]+)/)
-    : null;
-  const cookieCsrf = csrfMatch ? (csrfMatch[1] ?? null) : null;
-  if (!cookieCsrf || !cookieCsrf.length) return false;
-  if (cookieCsrf.length !== headerToken.length) return false;
+  const cookieToken = csrfTokenFromCookie(cookieHeader);
+  if (!cookieToken) return false;
+  if (cookieToken.length !== headerToken.length) return false;
   return timingSafeEqual(
-    Buffer.from(cookieCsrf, "utf8"),
+    Buffer.from(cookieToken, "utf8"),
     Buffer.from(headerToken, "utf8")
+  );
+}
+
+/**
+ * Full CSRF validation for an authenticated request: the double-submit pair
+ * must match AND the token must match the hash bound to the active session.
+ */
+export function validateSessionCsrf(
+  sessionId: string,
+  cookieHeader: string | null | undefined,
+  headerToken: string | null | undefined
+): boolean {
+  if (!sessionId || !headerToken) return false;
+  if (!validateCsrf(cookieHeader, headerToken)) return false;
+  const session = getSession(sessionId);
+  if (!session) return false;
+  const headerHash = hashToken(headerToken);
+  return timingSafeEqual(
+    Buffer.from(headerHash, "utf8"),
+    Buffer.from(session.csrfTokenHash, "utf8")
   );
 }
 

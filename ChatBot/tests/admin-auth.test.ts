@@ -11,6 +11,8 @@ import {
   clearCsrfTokenCookie,
   generateCsrfToken,
   validateCsrf,
+  validateSessionCsrf,
+  csrfTokenFromCookie,
 } from "../src/server/lib/admin-auth";
 
 describe("admin auth", () => {
@@ -34,19 +36,30 @@ describe("admin auth", () => {
   });
 
   it("session create/get/destroy round trip", () => {
-    const sid = createSession("token-x", 3600_000);
-    expect(typeof sid).toBe("string");
-    expect(sid.length).toBeGreaterThan(0);
-    const session = getSession(sid);
+    const { sessionId, csrfToken } = createSession("token-x", 3600_000);
+    expect(typeof sessionId).toBe("string");
+    expect(sessionId.length).toBeGreaterThan(0);
+    expect(typeof csrfToken).toBe("string");
+    expect(csrfToken.length).toBe(64);
+    const session = getSession(sessionId);
     expect(session).not.toBeNull();
     expect(session!.tokenHash).toBe(hashToken("token-x"));
-    destroySession(sid);
-    expect(getSession(sid)).toBeNull();
+    destroySession(sessionId);
+    expect(getSession(sessionId)).toBeNull();
   });
 
-  it("session stores hashed token", () => {
-    const sid = createSession("token-y", 3600_000);
-    expect(getSession(sid)!.tokenHash).toBe(hashToken("token-y"));
+  it("session stores hashed token and hashed CSRF token", () => {
+    const { sessionId, csrfToken } = createSession("token-y", 3600_000);
+    const session = getSession(sessionId)!;
+    expect(session.tokenHash).toBe(hashToken("token-y"));
+    expect(session.csrfTokenHash).toBe(hashToken(csrfToken));
+    expect(session.csrfTokenHash).not.toBe(csrfToken);
+    destroySession(sessionId);
+  });
+
+  it("expired sessions are rejected and removed", () => {
+    const { sessionId } = createSession("token-z", -1);
+    expect(getSession(sessionId)).toBeNull();
   });
 
   it("admin session cookie is HttpOnly, SameSite=Lax, Secure only over https", () => {
@@ -68,6 +81,7 @@ describe("admin auth", () => {
   it("csrf token cookie round trip via validateCsrf", () => {
     const token = generateCsrfToken();
     const cookie = csrfTokenCookie(token, false);
+    expect(csrfTokenFromCookie(cookie)).toBe(token);
     expect(validateCsrf(cookie, token)).toBe(true);
     expect(validateCsrf(cookie, "different-token")).toBe(false);
     expect(validateCsrf(cookie, null)).toBe(false);
@@ -86,5 +100,23 @@ describe("admin auth", () => {
     const b = generateCsrfToken();
     expect(a).not.toBe(b);
     expect(a.length).toBe(64);
+  });
+
+  it("CSRF token is bound to the session that issued it", () => {
+    const first = createSession("token-a", 3600_000);
+    const second = createSession("token-b", 3600_000);
+    const firstCookie = `${csrfTokenCookie(first.csrfToken, false)}; cafe_session=${first.sessionId}`;
+    const secondCookie = `${csrfTokenCookie(second.csrfToken, false)}; cafe_session=${second.sessionId}`;
+
+    // Correct pair for the first session.
+    expect(validateSessionCsrf(first.sessionId, firstCookie, first.csrfToken)).toBe(true);
+    // A valid token replayed against another session must fail.
+    expect(validateSessionCsrf(second.sessionId, firstCookie, first.csrfToken)).toBe(false);
+    // Header and cookie must still match.
+    expect(validateSessionCsrf(first.sessionId, firstCookie, second.csrfToken)).toBe(false);
+    // Expired/destroyed sessions fail closed.
+    destroySession(first.sessionId);
+    expect(validateSessionCsrf(first.sessionId, firstCookie, first.csrfToken)).toBe(false);
+    destroySession(second.sessionId);
   });
 });

@@ -14,6 +14,14 @@ MAX_MESSAGE_LENGTH = "2000"
 CORS_ALLOW_ORIGINS = "http://localhost:5173,http://localhost:5174"
 ADMIN_TOKEN = ""
 
+# Static assets are built into ./public by `npm run build:client`,
+# `npm run build:admin` and `npm run build:widget`. The Worker handles API
+# routes first; all other paths are served from the same origin so browser
+# cookies work in both local development and production.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
 # D1 database binding. For local development run: wrangler dev --local
 # (creates a local D1). For deployment, set a real database_id.
 [[d1_databases]]
