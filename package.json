@@ -1,0 +1,37 @@
+{
+  "name": "cafe-fernweh",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Café Fernweh — AI-powered café chatbot and academic AI behaviour research prototype (Sprint 1)",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev:client": "vite --config src/client/vite.config.ts",
+    "dev:server": "wrangler dev --port 8787 --ip 127.0.0.1",
+    "build:client": "vite build --config src/client/vite.config.ts",
+    "build:server": "wrangler deploy --dry-run",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:init": "node scripts/init-db.js"
+  },
+  "dependencies": {
+    "hono": "^4.6.11",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261109.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/sql.js": "^1.4.7",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "sql.js": "^1.9.0",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.6.3",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.6",
+    "wrangler": "^4.159.0"
+  }
+}

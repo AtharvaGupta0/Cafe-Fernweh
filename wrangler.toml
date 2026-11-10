@@ -1,0 +1,22 @@
+name = "cafe-fernweh"
+main = "src/server/index.ts"
+compatibility_date = "2024-11-01"
+
+# Defaults for local development. Override with `wrangler --env` or .env.
+[vars]
+AI_PROVIDER = "demo"
+AI_MODEL = "gemini-3.5-flash-lite"
+AI_REQUEST_TIMEOUT_MS = "30000"
+MAX_CONVERSATION_TURNS = "10"
+MAX_MESSAGE_LENGTH = "2000"
+CORS_ALLOW_ORIGINS = "http://localhost:5173"
+
+# D1 database binding. For local development run: wrangler dev --local
+# (creates a local D1). For deployment, set a real database_id.
+[[d1_databases]]
+binding = "DB"
+database_name = "cafe-fernweh"
+database_id = ""
+
+[observability]
+enabled = true
