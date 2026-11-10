@@ -78,26 +78,38 @@ npm run dev:server -- --local
 
 ## Experimental configurations
 
-Four grounding configurations are supported server-side (gated behind the
-`DEV_ADMIN_TOKEN`, never exposed publicly):
+Four grounding configurations are supported server-side:
 
 - **A** — model without menu grounding (baseline)
 - **B** — model with static menu context in the prompt
 - **C** — model with structured database retrieval
 - **D** — model with retrieval + deterministic validation (production default)
 
-See `ChatBot/experiments/` for the evaluation dataset, runner and metrics.
+D is always available. A, B and C are experimental and require both
+`DEV_ADMIN_TOKEN` on the Worker and a matching `EVAL_ADMIN_TOKEN` in the
+runner. If the token is missing or wrong, `/chat` returns **403** rather than
+silently falling back to D. `GET /eval/status` (protected) reports the
+server's actual provider, model, prompt version and generation parameters
+without spending model quota.
+
+See `ChatBot/experiments/` for the evaluation dataset, runner, metrics and
+`VALIDITY-AUDIT.md`. Historical raw files are append-only and are not rewritten;
+new runs must use a new results file (the runner defaults to
+`experiments/live-results.jsonl`).
 
 ## Security
 
 - Inference credentials are server-side only and gitignored (`.dev.vars`,
   `.env`); nothing secret reaches the browser.
 - Experimental/admin endpoints require authorisation (`DEV_ADMIN_TOKEN` for
-  configs, `ADMIN_TOKEN` + session cookie for admin).
-- Admin sessions use HttpOnly, SameSite cookies with SHA-256-hashed token
-  verification and constant-time comparison. CSRF protection (double-submit
-  token via `X-CSRF-Token` header) is enforced on state-changing admin
-  endpoints.
+  configs, `ADMIN_TOKEN` + session cookie for admin). A non-production
+  grounding request without a valid token is rejected with 403; it is never
+  silently downgraded.
+- Admin sessions use HttpOnly, SameSite=Lax cookies with SHA-256-hashed token
+  verification and constant-time comparison. CSRF protection is
+  session-bound: the `csrf_token` cookie and `X-CSRF-Token` header must match
+  each other and the active server-side session. Login attempts are throttled
+  per IP (5 failures / 5 minutes).
 - All database operations use parameterised SQL; all admin input is validated
   with Zod at the boundary.
 - Rate limiting is per IP per endpoint using in-memory state, which is per
@@ -151,11 +163,17 @@ Set these as Cloudflare Workers secrets/variables in the dashboard:
 clearly-labelled demonstration mode unless `GEMINI_API_KEY` and
 `AI_PROVIDER=gemini` are configured.
 
-The `wrangler.toml` previously included an `[[assets]]` binding to serve the
-frontend from the Worker; it was omitted here because this wrangler version
-did not accept it. Serve `public/client/`, `public/admin/` and
-`public/widget/` from your origin (or a CDN) in production so the admin
-session cookies are same-origin.
+`wrangler.toml` uses the supported single-table form
+`[assets] directory = "./public" binding = "ASSETS"` with explicit API routes.
+The Worker serves the client, admin dashboard and widget from the same origin,
+so HttpOnly admin session cookies work in production. Build all three static
+bundles before deploying:
+
+```bash
+npm run build:client
+npm run build:admin
+npm run build:widget
+```
 
 ## Database
 
@@ -165,9 +183,12 @@ Schema and seed data live in `db/`:
 - `db/migrations/0002_seed.sql` — idempotent fictional menu + sales seed.
 - `db/seeds/seed.sql` — same seed content, reusable via `scripts/init-db.js`.
 
-Local development uses a sql.js in-memory database (auto-seeded on first
-request). For `wrangler dev --local`, a local D1 is created and seeded
-automatically.
+Local development uses a sql.js in-memory database. The schema is always
+created idempotently, but fictional menu/sales demo rows are inserted only when
+`SEED_DEMO_DATA=true`. For a real deployment, provision D1, apply
+`db/migrations/0001_initial.sql`, and do **not** run `0002_seed.sql` unless you
+have explicit approval to use fictional demonstration data in that environment.
+See `DEPLOYMENT.md` for the deployment and rollback checklist.
 
 ## Known limitations
 
@@ -181,7 +202,15 @@ automatically.
 - The experimental evaluation runner records genuinely generated responses;
   objectively checkable claims are validated against the database, while
   generative responses that cannot be objectively checked are marked
-  "unverified" and require manual review.
+  "unverified" and require manual review. Demo-provider records are excluded
+  from all primary denominators.
+- Historical evaluation records contain mislabelled Config A attempts that
+  actually ran Config D. See `experiments/VALIDITY-AUDIT.md`; they are preserved
+  but not used as A evidence. A corrected A–D comparison must be collected with
+  `DEV_ADMIN_TOKEN`/`EVAL_ADMIN_TOKEN` and the returned-mode check.
+- Statistical significance is not claimed: the design has one observation per
+  case per configuration, and any category-level count may have a denominator
+  of only a few cases.
 
 ## Commands
 
@@ -197,4 +226,7 @@ automatically.
 | `npm run dev:client` | Local Vite dev server |
 | `npm run dev:server -- --local` | Local Worker with local D1 |
 | `npm run db:init` | Seed local database (sql.js) |
+| `npx tsx experiments/runner.ts` | Run the configured live evaluation (append-only) |
+| `npx tsx experiments/metrics.ts [file]` | Metrics with exclusions and per-config denominators |
+| `npx tsx experiments/eval-runner.ts` | Offline demo/tooling checks only (not model evidence) |
 
