@@ -12,6 +12,7 @@ node_modules/
 dist/
 build/
 **/public/client/
+**/public/widget/
 *.wrangler/state/
 .wrangler/
 

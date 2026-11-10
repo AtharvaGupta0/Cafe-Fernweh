@@ -76,16 +76,6 @@ Or run the backend against a local D1:
 npm run dev:server -- --local
 ```
 
-## Embedding in the café website
-
-The widget is framework-independent (vanilla JavaScript/Web Component) and does
-not require the host site to use React. See "Embedding the widget" below.
-
-```html
-<script src="/path/to/cafe-chatbot-widget.js"></script>
-<cafe-chatbot api-base="https://your-worker.example.com"></cafe-chatbot>
-```
-
 ## Experimental configurations
 
 Four grounding configurations are supported server-side (gated behind the
@@ -103,6 +93,49 @@ See `ChatBot/experiments/` for the evaluation dataset and runner.
 - Inference credentials are server-side only and gitignored.
 - Experimental/admin endpoints require authorisation.
 - No secrets are shipped to the browser.
+
+## Embedding the widget
+
+The widget is a framework-independent vanilla Web Component. It does not
+require the host site to use React.
+
+Build the widget bundle:
+
+```bash
+npm run build:widget   # -> ChatBot/public/widget/cafe-chatbot-widget.js
+```
+
+Embed on any page:
+
+```html
+<script src="/path/to/cafe-chatbot-widget.js"></script>
+<cafe-chatbot api-base="https://your-worker.example.com"></cafe-chatbot>
+```
+
+- `api-base` points to the running Café Fernweh Worker (default
+  `http://localhost:8787`). It is configurable per instance via the
+  attribute.
+- All styling lives in shadow DOM and will not conflict with the host site.
+- No inference credentials are shipped to the browser; all AI calls go
+  through the backend.
+- The standalone chat (Vite dev server at `npm run dev:client`) continues to
+  work independently.
+
+## Security
+
+- Inference credentials are server-side only and gitignored (`.dev.vars`,
+  `.env`); nothing secret reaches the browser.
+- Experimental/admin endpoints require authorisation (`DEV_ADMIN_TOKEN` for
+  configs, `ADMIN_TOKEN` + session cookie for admin).
+- Admin sessions use HttpOnly, SameSite cookies with SHA-256-hashed token
+  verification and constant-time comparison.
+- All database operations use parameterised SQL; all admin input is validated
+  with Zod at the boundary.
+- Rate limiting is per IP per endpoint using in-memory state, which is per
+  Worker isolate and not shared across Cloudflare Worker instances. For
+  production, back rate-limit state with a distributed store (KV/Redis).
+- Errors return generic messages; no stack traces or internals leak to the
+  client. Assistant replies are HTML-escaped before rendering.
 
 ## Commands
 

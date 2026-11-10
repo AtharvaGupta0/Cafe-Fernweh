@@ -14,6 +14,8 @@ import {
   deleteProductAdmin,
   listSalesAdmin,
   salesStatsAdmin,
+  recordSaleAdmin,
+  importSalesCsvAdmin,
   type AdminProductInput,
 } from "./lib/admin";
 import {
@@ -50,13 +52,18 @@ const DEFAULT_MAX_TURNS = 10;
 const conversations = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
 const conversationStates = new Map<string, ConversationState>();
 
-// Very simple in-memory rate limiter (requests per window per IP).
+// Very simple in-memory rate limiter (requests per window per IP + endpoint).
+// NOTE: in-memory state is per Worker isolate and is NOT shared across
+// Cloudflare Worker instances or deployments. For production use a distributed
+// backing store (e.g. KV/Redis) for rate-limit state. This is a prototype-
+// appropriate guard, not a production-grade abuse-prevention system.
 const rateLimit = new Map<string, { count: number; resetAt: number }>();
-function allowRequest(ip: string, limit: number, windowMs: number): boolean {
+function allowRequest(ip: string, endpoint: string, limit: number, windowMs: number): boolean {
   const now = Date.now();
-  const entry = rateLimit.get(ip);
+  const key = `${ip}:${endpoint}`;
+  const entry = rateLimit.get(key);
   if (!entry || now > entry.resetAt) {
-    rateLimit.set(ip, { count: 1, resetAt: now + windowMs });
+    rateLimit.set(key, { count: 1, resetAt: now + windowMs });
     return true;
   }
   if (entry.count >= limit) return false;
@@ -118,10 +125,11 @@ export default {
       })
     );
 
-    // Rate limiting: 60 requests per minute per IP.
+    // Rate limiting: 60 requests per minute per IP per endpoint. In-memory
+    // state is per Worker isolate; see comment above the limiter.
     app.use("*", async (c, next) => {
       const ip = c.req.header("CF-Connecting-IP") || "unknown";
-      if (!allowRequest(ip, 60, 60_000)) {
+      if (!allowRequest(ip, c.req.path, 60, 60_000)) {
         throw new HTTPException(429, { message: "Too many requests. Please slow down." });
       }
       await next();
@@ -306,6 +314,29 @@ export default {
         salesStatsAdmin(db as any),
       ]);
       return c.json({ list, stats });
+    });
+
+    app.post("/admin/sales", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const input = await c.req.json<{ items: Array<{ product_id: number; quantity: number; unit_price_cents: number }> }>();
+      const result = await recordSaleAdmin(db as any, input);
+      return c.json(result);
+    });
+
+    app.post("/admin/sales/import", async (c) => {
+      requireAdmin(c);
+      const db = getDatabase(env);
+      if (!db) throw new HTTPException(503, { message: "Database not available." });
+      const body = await c.req.json<{ csv?: unknown }>();
+      const csv = typeof body?.csv === "string" ? body.csv : "";
+      const maxBytes = 5 * 1024 * 1024; // 5 MB limit
+      if (new TextEncoder().encode(csv).length > maxBytes) {
+        throw new HTTPException(413, { message: "CSV file too large." });
+      }
+      const result = await importSalesCsvAdmin(db as any, csv);
+      return c.json(result);
     });
 
     app.onError((err, c) => {
