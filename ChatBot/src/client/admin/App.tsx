@@ -41,7 +41,7 @@ const API = "/admin";
 
 function api(path: string, body?: unknown, method = "GET") {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (body !== undefined && method !== "GET") {
+  if (method !== "GET") {
     headers["X-CSRF-Token"] = document.cookie
       .split("; ")
       .find((c) => c.trimStart().startsWith("csrf_token="))
@@ -91,6 +91,18 @@ export default function App() {
   useEffect(() => {
     checkSession();
   }, []);
+
+  // Load the data for the view that becomes active. Login and session checks
+  // only switch `view`; without this effect the dashboard would render an empty
+  // table because no request was ever issued.
+  useEffect(() => {
+    if (view === "menu") {
+      void loadMenu();
+      void loadReferenceData();
+    } else if (view === "sales") {
+      void loadSales();
+    }
+  }, [view]);
 
   async function checkSession() {
     setLoading(true);
@@ -223,9 +235,9 @@ export default function App() {
   async function loadSales() {
     setLoading(true);
     try {
-      const [listRes, statsRes] = await Promise.all([api("/sales"), api("/sales")]);
-      // NOTE: /admin/sales returns both list and stats in one response.
-      const data = (await (await api("/sales")).json()) as any;
+      // /admin/sales returns both the list and the aggregate stats.
+      const res = await api("/sales");
+      const data = (await res.json()) as any;
       setSales(data.list || []);
       setStats(data.stats || null);
     } finally {
