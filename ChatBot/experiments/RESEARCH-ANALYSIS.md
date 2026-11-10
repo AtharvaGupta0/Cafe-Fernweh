@@ -95,3 +95,67 @@ The per-config outcome differences reflect prompt-template and retrieval-path be
 ## Conclusion
 
 For this prototype, static menu context (B) is the most accurate and consistent grounding mode; database retrieval (C) and retrieval + deterministic validation (D) did not improve factual accuracy and reduced consistency. Dietary/allergen advice is unreliable in every config and should not be offered without human verification. Results are one observation per case per configuration; no statistical significance is claimed. Full raw records: `experiments/live-results.jsonl`; metrics: `experiments/metrics.ts`; validity audit of earlier (mislabelled) records: `experiments/VALIDITY-AUDIT.md`.
+
+---
+
+## Post-Correction Analysis (reliability fixes)
+
+### Root causes identified
+
+The original A–D evaluation revealed specific reliability failures. Root-cause analysis of the records and code traced them to:
+
+1. **Missing temperature filtering** (`src/server/lib/menu.ts`, `src/shared/schema.ts`): `filterProducts` had no `temperature` parameter, and `getRecommendationCandidates` dropped `temperature` from constraints. EVAL-015 (cold-coffee follow-up) could not filter to cold drinks, so the model recommended Espresso instead of Cold Brew.
+
+2. **Missing state inheritance from `search_products`** (`src/server/lib/state.ts`): `updateFromToolResult` only updated category/temperature from `filter_products` and `get_recommendation_candidates`, not from `search_products`. Multi-turn conversations that discovered products via search could not carry category/temperature forward.
+
+3. **Narrow dietary validation** (`src/server/lib/validation.ts`): `validateReply` only checked dietary claims found within a 120-character window of a product name. Claims made elsewhere in the reply (e.g. "Cappuccino is vegan" before the product name) were missed. Unknown dietary status was not treated as a failure.
+
+4. **Unverified allergen-safe claims not blocked** (`src/server/lib/validation.ts`): The allergen check only matched the specific allergen name (e.g. "almonds"), not category-level claims (e.g. "nut-free" covering an unverified almond allergen).
+
+5. **Evaluation metric bug** (`experiments/runner.ts`, `checkFactual`): Each price mention was matched to the *longest* product name in the vicinity, not the nearest one. A price for Espresso could be validated against Americano's price, producing false failures.
+
+### Code changes
+
+- `src/shared/schema.ts`: Added `temperature?: string` to `productFilterArgsSchema`.
+- `src/server/lib/menu.ts`: Added temperature SQL filtering (name/description keyword matching); `getRecommendationCandidates` now passes `temperature` through.
+- `src/server/lib/state.ts`: `updateFromToolResult` now infers category/temperature from `search_products` results, and infers temperature from the search query for multi-result searches. Added `temperatureFromProduct()` helper.
+- `src/server/lib/validation.ts`: Dietary claims are now found globally across the reply (regex `g` flag) and each is verified via `evaluateDietary`. Unknown status is a failure. Allergen check covers category-level claims (e.g. "nut-free" covers unverified almonds). Exported `DAIRY_ALLERGENS`, `NUT_ALLERGENS`, `GLUTEN_ALLERGENS`.
+- `src/server/lib/orchestration.ts`: Products accumulated across multiple tool calls instead of being replaced.
+- `experiments/runner.ts`: `checkFactual` now matches each price to the *nearest* product name by position, fixing false price mismatches.
+
+### Regression tests added
+
+- `tests/menu.test.ts`: temperature filtering (hot/cold/iced), recommendation candidates with temperature.
+- `tests/conversation.test.ts`: `temperatureFromProduct`, state inheritance from `search_products` (single and multi-result), multi-turn cold-coffee follow-up.
+- `tests/deterministic-validation.test.ts`: global dietary claims, unknown dietary status as failure, unverified allergen-safe blocking, Config D blocking unsupported vegan claims, dairy-free/lactose-free verification.
+
+### Post-correction results
+
+**Gemini quota was exhausted before a full live A–D re-evaluation could be completed.** Only partial live records were generated (`experiments/live-results-fixed.jsonl`) before quota exhaustion. A demo-provider evaluation (tooling evidence, not genuine model trials) confirmed:
+
+- Temperature filtering correctly returns cold coffees (Cold Brew, Iced Latte); Cheapest cold coffee is Cold Brew at ₹140. ✓
+- Conversation state carries `category: "Coffee"` and `temperature: "cold"` across turns. ✓
+- `validateReply` blocks unsupported vegan claims (Cappuccino → dietary failure). ✓
+- `validateReply` blocks unverified allergen-safe claims (Espresso nut-free → dietary + allergen failures). ✓
+
+All 79 unit tests pass, including the 15 new regression tests.
+
+### Original vs corrected findings
+
+| Metric | Original (pre-fix, live Gemini) | Post-correction |
+|--------|--------------------------------|-----------------|
+| B factual accuracy | 83.3% (10/12) | Not re-evaluated live (quota exhausted) |
+| C factual accuracy | 42.9% (6/14) | Not re-evaluated live (quota exhausted) |
+| D factual accuracy | 28.6% (4/14) | Not re-evaluated live (quota exhausted) |
+| Dietary accuracy | 0.0% wherever checkable | Code fixes address root causes; not re-evaluated live |
+| EVAL-015 (cold follow-up) | Fail in C/D | Demo: state carries cold+coffee correctly |
+
+**No claim of improved experimental accuracy is made.** The code fixes address identified root causes, but a full live re-evaluation across B, C and D was not possible due to Gemini free-tier quota exhaustion. The original results in `experiments/live-results.jsonl` remain the authoritative evidence; post-correction observations are from unit tests and demo-provider tooling only.
+
+### Remaining reliability limitations
+
+- Dietary/allergen advice remains unreliable for products without verified allergen data; the system correctly reports "unknown" but cannot affirm safety.
+- Config D's deterministic validation only checks explicit factual claims; the model can avoid making claims and thereby evade validation.
+- Gemini free-tier quota limits experimental completeness; A–D runs may be incomplete.
+- One observation per case per configuration; no statistical significance.
+- Session/rate-limit state is per Worker isolate, not shared across instances.
